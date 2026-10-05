@@ -1,0 +1,11 @@
+# Local build products and signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.deb
+*.o
+*.ko
+*.log
+.config
+/local/
