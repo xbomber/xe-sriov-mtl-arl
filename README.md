@@ -64,6 +64,31 @@ intel_iommu=on iommu=pt xe.force_probe=7d51 i915.force_probe=!7d51 module_blackl
 
 Keep a known working kernel available and use an explicitly selected test boot. The tested fallback was an i915 6.17 kernel. [Test results and unresolved problems](docs/TESTING.md).
 
+## Recommended Windows VM configuration
+
+To help avoid Intel graphics **Code 43** in Windows guests, use the following `<features>` section in the libvirt domain XML:
+
+```xml
+<features>
+  <acpi/>
+  <apic/>
+  <hyperv mode="passthrough">
+  </hyperv>
+  <vmport state="off"/>
+  <smm state="on"/>
+</features>
+```
+
+Merge this into the VM's existing `<features>` section rather than adding a second section.
+
+## Guest screenshot
+
+Windows guest running the WebGL Aquarium demo, captured from Looking Glass shared memory at **1920×1080** on 2026-10-05:
+
+![WebGL Aquarium in the Windows SR-IOV guest, captured through Looking Glass](docs/images/windows-vf-webgl-aquarium-20261005.png)
+
+The displayed FPS counter is not a validated benchmark. Missing fonts and labels remain an [open rendering issue](docs/TESTING.md#open-issues-and-untested-cases).
+
 ## AI-assisted development
 
 The implementation was developed with **OpenAI Codex / LLM assistance**, through analysis of older i915 SR-IOV code, the official Intel i915 DKMS patch series, Xe paths for other enabled platforms, and public Intel technical manuals. The Xe integration follows its existing scheduling and resource model. [Methods, sources and attribution](docs/PROVENANCE.md).
