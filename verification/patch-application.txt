@@ -1,0 +1,7 @@
+Base commit: c4227406af3b9ad8f8072b222ca06e0039f64441
+Fresh patch extraction from the tested kernel build source.
+git apply --check: PASS
+git apply: PASS
+Resulting Xe source files: 20/20 match the compiled-source SHA-256 manifest.
+Scope: 20 Xe files, 620 insertions, 2 deletions.
+This validates patch application and source identity, not general hardware support.

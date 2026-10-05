@@ -1,0 +1,988 @@
+diff --git a/drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h b/drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h
+new file mode 100644
+index 000000000..b442278f5
+--- /dev/null
++++ b/drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: MIT */
++/* Intel i915 IOV UPDATE_GGTT32 ABI, shared with the Windows VF driver. */
++#ifndef _GUC_GGTT_RELAY_ABI_H_
++#define _GUC_GGTT_RELAY_ABI_H_
++
++#include <linux/bits.h>
++
++#include "guc_relay_communication_abi.h"
++
++#define GUC_RELAY_ACTION_VF2PF_UPDATE_GGTT32	0x0102u
++#define VF2PF_GGTT_REQUEST_MIN_LEN		4u
++#define VF2PF_GGTT_REQUEST_MAX_PTES		((GUC_RELAY_MSG_MAX_LEN - 2u) / 2u)
++#define VF2PF_GGTT_OFFSET			GENMASK(31, 12)
++#define VF2PF_GGTT_MODE				GENMASK(11, 10)
++#define VF2PF_GGTT_COPIES				GENMASK(9, 0)
++#define VF2PF_GGTT_MAX_EXPANDED_PTES		(1023u + VF2PF_GGTT_REQUEST_MAX_PTES)
++
++#endif
+diff --git a/drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h b/drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h
+new file mode 100644
+index 000000000..f67803880
+--- /dev/null
++++ b/drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2022 Intel Corporation
++ * Adapted from Intel i915 guc_actions_pf_abi.h and iov_actions_mmio_abi.h.
++ */
++#ifndef _GUC_MMIO_RELAY_ABI_H_
++#define _GUC_MMIO_RELAY_ABI_H_
++#include <linux/bits.h>
++
++/* CTB event: header, VFID, magic/opcode, three payload dwords. */
++#define GUC_ACTION_GUC2PF_MMIO_RELAY_SERVICE	0x5006
++#define GUC_ACTION_PF2GUC_MMIO_RELAY_SUCCESS	0x5007
++#define GUC_ACTION_PF2GUC_MMIO_RELAY_FAILURE	0x5008
++#define GUC_MMIO_RELAY_EVENT_LEN			6u
++#define GUC_MMIO_RELAY_MAGIC			GENMASK(27, 24)
++#define GUC_MMIO_RELAY_OPCODE			GENMASK(23, 16)
++#define GUC_MMIO_RELAY_MBZ			(GENMASK(31, 28) | GENMASK(15, 0))
++
++#define IOV_MMIO_HANDSHAKE			0x01
++#define IOV_MMIO_UPDATE_GGTT			0x02
++#define IOV_MMIO_GET_RUNTIME			0x10
++#define IOV_MMIO_GGTT_OFFSET			GENMASK(31, 12)
++#define IOV_MMIO_GGTT_MODE			GENMASK(11, 10)
++#define IOV_MMIO_GGTT_COPIES			GENMASK(9, 0)
++#define IOV_MMIO_GGTT_DUPLICATE			0
++#define IOV_MMIO_GGTT_REPLICATE			1
++#define IOV_MMIO_GGTT_DUPLICATE_LAST		2
++#define IOV_MMIO_GGTT_REPLICATE_LAST		3
++
++#endif
+diff --git a/drivers/gpu/drm/xe/instructions/xe_mi_commands.h b/drivers/gpu/drm/xe/instructions/xe_mi_commands.h
+index ad7d98f2d..d3f7ffc2e 100644
+--- a/drivers/gpu/drm/xe/instructions/xe_mi_commands.h
++++ b/drivers/gpu/drm/xe/instructions/xe_mi_commands.h
+@@ -55,6 +55,7 @@
+ 					 REG_BIT(21))
+ 
+ #define MI_LOAD_REGISTER_IMM		__MI_INSTR(0x22)
++#define MI_UPDATE_GTT			__MI_INSTR(0x23)
+ #define   MI_LRI_LRM_CS_MMIO		REG_BIT(19)
+ #define   MI_LRI_MMIO_REMAP_EN		REG_BIT(17)
+ #define   MI_LRI_NUM_REGS(x)		XE_INSTR_NUM_DW(2 * (x) + 1)
+diff --git a/drivers/gpu/drm/xe/xe_ggtt.c b/drivers/gpu/drm/xe/xe_ggtt.c
+index a351c578b..eb301e6a3 100644
+--- a/drivers/gpu/drm/xe/xe_ggtt.c
++++ b/drivers/gpu/drm/xe/xe_ggtt.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "xe_ggtt.h"
++#include "abi/guc_ggtt_relay_abi.h"
+ 
+ #include <kunit/visibility.h>
+ #include <linux/fault-inject.h>
+@@ -24,6 +25,7 @@
+ #include "xe_gt_types.h"
+ #include "xe_map.h"
+ #include "xe_mmio.h"
++#include "xe_migrate.h"
+ #include "xe_pat.h"
+ #include "xe_pm.h"
+ #include "xe_res_cursor.h"
+@@ -940,6 +942,72 @@ u64 xe_ggtt_largest_hole(struct xe_ggtt *ggtt, u64 alignment, u64 *spare)
+ }
+ 
+ #ifdef CONFIG_PCI_IOV
++struct dma_fence *xe_ggtt_update_vf(struct xe_ggtt_node *node, u16 vfid,
++				 u32 offset, u8 mode, u16 copies, u64 pte)
++{
++	return xe_ggtt_update_vf_ptes(node, vfid, offset, mode, copies, &pte, 1);
++}
++
++struct dma_fence *xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid,
++				      u32 offset, u8 mode, u16 copies,
++				      const u64 *input, u32 count)
++{
++	const u64 addr_mask = GENMASK_ULL(45, 12);
++	const u64 pat_mask = XELPG_GGTT_PTE_PAT0 | XELPG_GGTT_PTE_PAT1;
++	struct xe_ggtt *ggtt = node->ggtt;
++	u32 total = count + copies, i, j = 0, selected;
++	u64 start = xe_ggtt_node_addr(node), size = xe_ggtt_node_size(node);
++	u64 relative = (u64)offset * XE_PAGE_SIZE, addr, flags;
++	struct dma_fence *fence;
++	u64 *ptes;
++
++	if (!vfid || !FIELD_FIT(GGTT_PTE_VFID, vfid) || mode > 3 || copies > 1023 ||
++	    !count || count > VF2PF_GGTT_REQUEST_MAX_PTES)
++		return ERR_PTR(-EINVAL);
++	if (relative > size || (u64)total * XE_PAGE_SIZE > size - relative ||
++	    start + relative + (u64)total * XE_PAGE_SIZE > GUC_GGTT_TOP)
++		return ERR_PTR(-ERANGE);
++	/* Validate every input before submitting any partial update. */
++	for (i = 0; i < count; i++)
++		if (!(input[i] & XE_PAGE_PRESENT) ||
++		    (input[i] & ~(addr_mask | pat_mask | GGTT_PTE_VFID | XE_PAGE_PRESENT)))
++			return ERR_PTR(-EINVAL);
++	selected = (mode & 2) ? count - 1 : 0;
++	addr = input[selected] & addr_mask;
++	if ((mode & 1) && addr + (u64)copies * XE_PAGE_SIZE > addr_mask)
++		return ERR_PTR(-ERANGE);
++
++	ptes = kmalloc_array(total, sizeof(*ptes), GFP_KERNEL);
++	if (!ptes)
++		return ERR_PTR(-ENOMEM);
++	for (i = 0; i < count; i++) {
++		addr = input[i] & addr_mask;
++		flags = (input[i] & pat_mask) | FIELD_PREP(GGTT_PTE_VFID, vfid) |
++			XE_PAGE_PRESENT;
++		ptes[j++] = flags | addr;
++		if (i == selected)
++			for (u32 n = 1; n <= copies; n++)
++				ptes[j++] = flags | (addr + ((mode & 1) ?
++							   (u64)n * XE_PAGE_SIZE : 0));
++	}
++
++	/* Caller pins the VF configuration via the outstanding transaction flag. */
++	fence = xe_migrate_update_ggtt(ggtt->tile->migrate, start + relative, ptes, total);
++	kfree(ptes);
++	return fence;
++}
++
++int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt)
++{
++	int err;
++
++	xe_mmio_read32(xe_root_tile_mmio(tile_to_xe(ggtt->tile)), VF_CAP_REG);
++	err = xe_tlb_inval_ggtt(&ggtt->tile->primary_gt->tlb_inval);
++	if (!err && ggtt->tile->media_gt)
++		err = xe_tlb_inval_ggtt(&ggtt->tile->media_gt->tlb_inval);
++	return err;
++}
++
+ static u64 xe_encode_vfid_pte(u16 vfid)
+ {
+ 	return FIELD_PREP(GGTT_PTE_VFID, vfid) | XE_PAGE_PRESENT;
+diff --git a/drivers/gpu/drm/xe/xe_ggtt.h b/drivers/gpu/drm/xe/xe_ggtt.h
+index c864cc975..c9127aa94 100644
+--- a/drivers/gpu/drm/xe/xe_ggtt.h
++++ b/drivers/gpu/drm/xe/xe_ggtt.h
+@@ -12,6 +12,7 @@ struct drm_printer;
+ struct xe_bo;
+ struct xe_tile;
+ struct drm_exec;
++struct dma_fence;
+ 
+ struct xe_ggtt *xe_ggtt_alloc(struct xe_tile *tile);
+ int xe_ggtt_init_early(struct xe_ggtt *ggtt);
+@@ -42,6 +43,12 @@ int xe_ggtt_dump(struct xe_ggtt *ggtt, struct drm_printer *p);
+ u64 xe_ggtt_print_holes(struct xe_ggtt *ggtt, u64 alignment, struct drm_printer *p);
+ 
+ #ifdef CONFIG_PCI_IOV
++struct dma_fence *xe_ggtt_update_vf(struct xe_ggtt_node *node, u16 vfid,
++				 u32 offset, u8 mode, u16 copies, u64 pte);
++struct dma_fence *xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid,
++				      u32 offset, u8 mode, u16 copies,
++				      const u64 *input, u32 count);
++int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt);
+ void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid);
+ int xe_ggtt_node_save(struct xe_ggtt_node *node, void *dst, size_t size, u16 vfid);
+ int xe_ggtt_node_load(struct xe_ggtt_node *node, const void *src, size_t size, u16 vfid);
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
+index 786805684..ab9b0a745 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
+@@ -98,6 +98,8 @@ static void pf_fini_action(void *arg)
+ 	struct xe_gt *gt = arg;
+ 
+ 	pf_fini_workers(gt);
++	xe_gt_sriov_pf_service_stop_mmio(gt);
++	xe_gt_sriov_pf_service_flush_mmio(gt);
+ }
+ 
+ static int pf_init_late(struct xe_gt *gt)
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
+index 2c9b85b84..e61af4ea1 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
+@@ -18,6 +18,7 @@
+ #include "xe_gt.h"
+ #include "xe_gt_sriov_pf_config.h"
+ #include "xe_gt_sriov_pf_helpers.h"
++#include "xe_gt_sriov_pf_service.h"
+ #include "xe_gt_sriov_pf_policy.h"
+ #include "xe_gt_sriov_printk.h"
+ #include "xe_guc.h"
+@@ -514,6 +515,8 @@ static int pf_provision_vf_ggtt(struct xe_gt *gt, unsigned int vfid, u64 size)
+ 	xe_gt_assert(gt, IS_SRIOV_PF(gt_to_xe(gt)));
+ 
+ 	size = round_up(size, alignment);
++	if (xe_gt_sriov_pf_service_mmio_busy(gt, vfid))
++		return -EBUSY;
+ 
+ 	if (config->ggtt_region) {
+ 		err = pf_distribute_config_ggtt(tile, vfid, 0, 0);
+@@ -2878,7 +2881,12 @@ int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool forc
+ 
+ 	xe_gt_assert(gt, vfid);
+ 
++	xe_gt_sriov_pf_service_flush_mmio_vf(gt, vfid);
+ 	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
++	if (xe_gt_sriov_pf_service_mmio_busy(gt, vfid)) {
++		mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
++		return -EBUSY;
++	}
+ 	err = pf_send_vf_cfg_reset(gt, vfid);
+ 	if (!err || force)
+ 		pf_release_vf_config(gt, vfid);
+@@ -2964,6 +2972,7 @@ int xe_gt_sriov_pf_config_sanitize(struct xe_gt *gt, unsigned int vfid, long tim
+ 
+ 	xe_gt_assert(gt, vfid != PFID);
+ 
++	xe_gt_sriov_pf_service_flush_mmio_vf(gt, vfid);
+ 	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
+ 	err = pf_sanitize_vf_resources(gt, vfid, timeout);
+ 	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c
+index 058585f06..104274443 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c
+@@ -13,6 +13,7 @@
+ #include "xe_gt_sriov_pf_config.h"
+ #include "xe_gt_sriov_pf_control.h"
+ #include "xe_gt_sriov_pf_helpers.h"
++#include "xe_gt_sriov_pf_service.h"
+ #include "xe_gt_sriov_pf_migration.h"
+ #include "xe_gt_sriov_pf_monitor.h"
+ #include "xe_gt_sriov_printk.h"
+@@ -1557,11 +1558,17 @@ static bool pf_enter_vf_flr_wip(struct xe_gt *gt, unsigned int vfid)
+ {
+ 	if (!pf_enter_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP))
+ 		return false;
++	xe_gt_sriov_pf_service_reset_mmio_vf(gt, vfid);
+ 
+ 	pf_enter_vf_wip(gt, vfid);
+ 	return true;
+ }
+ 
++bool xe_gt_sriov_pf_control_flr_in_progress(struct xe_gt *gt, u32 vfid)
++{
++	return pf_check_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP);
++}
++
+ static void pf_exit_vf_flr_wip(struct xe_gt *gt, unsigned int vfid)
+ {
+ 	if (pf_exit_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP)) {
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h
+index 23182a5c5..6357ff759 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h
+@@ -12,6 +12,7 @@
+ struct xe_gt;
+ 
+ int xe_gt_sriov_pf_control_init(struct xe_gt *gt);
++bool xe_gt_sriov_pf_control_flr_in_progress(struct xe_gt *gt, u32 vfid);
+ void xe_gt_sriov_pf_control_restart(struct xe_gt *gt);
+ 
+ int xe_gt_sriov_pf_control_pause_vf(struct xe_gt *gt, unsigned int vfid);
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c
+index 6586df2fc..922330e99 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c
+@@ -4,14 +4,22 @@
+  */
+ 
+ #include <drm/drm_managed.h>
++#include <linux/dma-fence.h>
++#include <linux/delay.h>
+ 
+ #include "abi/guc_relay_actions_abi.h"
++#include "abi/guc_mmio_relay_abi.h"
++#include "abi/guc_ggtt_relay_abi.h"
+ 
+ #include "regs/xe_gt_regs.h"
+ #include "regs/xe_guc_regs.h"
+ 
+ #include "xe_assert.h"
+ #include "xe_mmio.h"
++#include "xe_gt_sriov_pf_helpers.h"
++#include "xe_gt_sriov_pf_control.h"
++#include "xe_ggtt.h"
++#include "xe_pm.h"
+ #include "xe_gt_sriov_printk.h"
+ #include "xe_gt_sriov_pf_service.h"
+ #include "xe_gt_sriov_pf_service_types.h"
+@@ -20,6 +28,325 @@
+ #include "xe_sriov.h"
+ #include "xe_sriov_pf_service.h"
+ 
++static void pf_mmio_worker(struct work_struct *work);
++
++static bool pf_mmio_current(struct xe_gt_sriov_pf_mmio *mmio)
++{
++	struct xe_gt *gt = mmio->gt;
++
++	return mmio->request_generation == atomic_read(&mmio->generation) &&
++	       mmio->request_epoch == atomic_read(&gt->sriov.pf.service.mmio_epoch) &&
++	       mmio->primary_epoch ==
++	       atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch) &&
++	       !xe_gt_sriov_pf_control_flr_in_progress(gt, mmio->vfid) &&
++	       !xe_gt_sriov_pf_control_flr_in_progress(gt->tile->primary_gt, mmio->vfid) &&
++	       xe_guc_ct_enabled(&gt->uc.guc.ct);
++}
++
++void xe_gt_sriov_pf_service_stop_mmio(struct xe_gt *gt)
++{
++	if (IS_SRIOV_PF(gt_to_xe(gt)) && gt->sriov.pf.service.mmio_wq)
++		atomic_inc(&gt->sriov.pf.service.mmio_epoch);
++}
++
++void xe_gt_sriov_pf_service_flush_mmio(struct xe_gt *gt)
++{
++	if (gt->sriov.pf.service.mmio_wq)
++		flush_workqueue(gt->sriov.pf.service.mmio_wq);
++}
++
++void xe_gt_sriov_pf_service_reset_mmio_vf(struct xe_gt *gt, u32 vfid)
++{
++	if (gt->sriov.pf.service.mmio_wq)
++		atomic_inc(&gt->sriov.pf.vfs[vfid].mmio.generation);
++}
++
++bool xe_gt_sriov_pf_service_mmio_busy(struct xe_gt *gt, u32 vfid)
++{
++	struct xe_gt *other;
++	u32 id;
++
++	for_each_gt(other, gt_to_xe(gt), id)
++		if (other->sriov.pf.service.mmio_wq &&
++		    atomic_read(&other->sriov.pf.vfs[vfid].mmio.pending))
++			return true;
++	return false;
++}
++
++/* Must be called without the PF master mutex or the CT mutex. */
++void xe_gt_sriov_pf_service_flush_mmio_vf(struct xe_gt *gt, u32 vfid)
++{
++	struct xe_gt *other;
++	u32 id;
++
++	for_each_gt(other, gt_to_xe(gt), id)
++		if (other->sriov.pf.service.mmio_wq)
++			flush_work(&other->sriov.pf.vfs[vfid].mmio.work);
++}
++
++static int pf_mmio_runtime(struct xe_gt *gt, const u32 *msg, u32 *data)
++{
++	struct xe_gt_sriov_pf_service_runtime_regs *runtime;
++	struct xe_gt *other;
++	u32 i, j, id;
++	bool found;
++
++	if (!msg[3])
++		return -EINVAL;
++	for (i = 0; i < 3; i++) {
++		if (!msg[i + 3])
++			continue;
++		found = false;
++		for_each_gt(other, gt_to_xe(gt), id) {
++			runtime = &other->sriov.pf.service.runtime;
++			for (j = 0; j < runtime->size; j++) {
++				if (msg[i + 3] != xe_mmio_adjusted_addr(&other->mmio,
++								     runtime->regs[j].addr))
++					continue;
++				data[i + 1] = READ_ONCE(runtime->values[j]);
++				found = true;
++				break;
++			}
++			if (found)
++				break;
++		}
++		if (!found) {
++			xe_gt_sriov_notice(gt, "MMIO runtime offset %#x is not cached\n", msg[i + 3]);
++			return -EACCES;
++		}
++	}
++	return 0;
++}
++
++static int pf_update_vf_ggtt(struct xe_gt_sriov_pf_mmio *mmio, u32 offset,
++			     u8 mode, u16 copies, const u64 *ptes, u32 count)
++{
++	struct xe_gt *gt = mmio->gt, *primary = gt->tile->primary_gt;
++	struct xe_ggtt_node *node;
++	struct dma_fence *fence;
++	int err;
++
++	if (MEDIA_VERx100(gt_to_xe(gt)) != 1300)
++		return -EOPNOTSUPP;
++
++	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
++	node = primary->sriov.pf.vfs[mmio->vfid].config.ggtt_region;
++	if (!pf_mmio_current(mmio) || !node) {
++		mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
++		return -ECANCELED;
++	}
++	fence = xe_ggtt_update_vf_ptes(node, mmio->vfid, offset, mode, copies, ptes, count);
++	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
++	if (IS_ERR(fence))
++		return PTR_ERR(fence);
++
++	/* Keep the VF region pinned until HW completes, also on a scheduler reset. */
++	err = dma_fence_wait(fence, false);
++	if (!err)
++		err = dma_fence_get_status(fence);
++	dma_fence_put(fence);
++	if (err < 0)
++		return err;
++	if (!pf_mmio_current(mmio))
++		return -ECANCELED;
++	err = xe_ggtt_invalidate_vf(gt->tile->mem.ggtt);
++	if (err)
++		return err;
++	return copies + count;
++}
++
++static int pf_mmio_update_ggtt(struct xe_gt_sriov_pf_mmio *mmio, u32 *data)
++{
++	u32 *msg = mmio->msg;
++	u64 pte = ((u64)msg[5] << 32) | msg[4];
++	int ret;
++
++	ret = pf_update_vf_ggtt(mmio, FIELD_GET(IOV_MMIO_GGTT_OFFSET, msg[3]),
++				FIELD_GET(IOV_MMIO_GGTT_MODE, msg[3]),
++				FIELD_GET(IOV_MMIO_GGTT_COPIES, msg[3]), &pte, 1);
++	if (ret < 0)
++		return ret;
++	data[0] = ret;
++	return 0;
++}
++
++static int pf_ctb_update_ggtt(struct xe_gt_sriov_pf_mmio *mmio)
++{
++	u64 *ptes;
++	u32 *msg = mmio->ctb_msg;
++	u32 count = (mmio->ctb_len - 2) / 2, i;
++	int ret;
++
++	ptes = kmalloc_array(count, sizeof(*ptes), GFP_KERNEL);
++	if (!ptes)
++		return -ENOMEM;
++	for (i = 0; i < count; i++)
++		ptes[i] = ((u64)msg[3 + 2 * i] << 32) | msg[2 + 2 * i];
++	ret = pf_update_vf_ggtt(mmio, FIELD_GET(VF2PF_GGTT_OFFSET, msg[1]),
++			      FIELD_GET(VF2PF_GGTT_MODE, msg[1]),
++			      FIELD_GET(VF2PF_GGTT_COPIES, msg[1]), ptes, count);
++	kfree(ptes);
++	return ret;
++}
++
++static void pf_mmio_worker(struct work_struct *work)
++{
++	struct xe_gt_sriov_pf_mmio *mmio = container_of(work, typeof(*mmio), work);
++	struct xe_gt *gt = mmio->gt;
++	struct xe_device *xe = gt_to_xe(gt);
++	struct xe_guc_ct *ct = &gt->uc.guc.ct;
++	u32 opcode = FIELD_GET(GUC_MMIO_RELAY_OPCODE, mmio->msg[2]);
++	u32 magic = FIELD_GET(GUC_MMIO_RELAY_MAGIC, mmio->msg[2]);
++	u32 data[4] = {}, reply[6] = {}, major, minor;
++	u32 len, retry;
++	int err = -ECANCELED, ret = 0;
++	bool ctb = mmio->ctb;
++
++	xe_pm_runtime_get(xe);
++	if (ctb) {
++		if (pf_mmio_current(mmio))
++			err = pf_ctb_update_ggtt(mmio);
++		xe_gt_sriov_info(gt, "CTB GGTT VF%u offset %#x mode %u copies %u ptes %u result %d\n",
++				 mmio->vfid, (u32)FIELD_GET(VF2PF_GGTT_OFFSET, mmio->ctb_msg[1]),
++				 (u32)FIELD_GET(VF2PF_GGTT_MODE, mmio->ctb_msg[1]),
++				 (u32)FIELD_GET(VF2PF_GGTT_COPIES, mmio->ctb_msg[1]),
++				 (mmio->ctb_len - 2) / 2, err);
++		mmio->ctb_result = err;
++		goto done;
++	}
++	if (!pf_mmio_current(mmio))
++		goto done;
++	switch (opcode) {
++	case IOV_MMIO_HANDSHAKE:
++		if (mmio->msg[4] || mmio->msg[5]) {
++			err = -EPROTO;
++			break;
++		}
++		mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
++		err = xe_sriov_pf_service_handshake_vf(xe, mmio->vfid,
++						     mmio->msg[3] >> 16,
++						     mmio->msg[3] & 0xffff, &major, &minor);
++		mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
++		if (!err)
++			data[1] = major << 16 | minor;
++		break;
++	case IOV_MMIO_GET_RUNTIME:
++		err = pf_mmio_runtime(gt, mmio->msg, data);
++		break;
++	case IOV_MMIO_UPDATE_GGTT:
++		err = pf_mmio_update_ggtt(mmio, data);
++		break;
++	default:
++		err = -EOPNOTSUPP;
++	}
++
++	reply[0] = err ? GUC_ACTION_PF2GUC_MMIO_RELAY_FAILURE :
++			 GUC_ACTION_PF2GUC_MMIO_RELAY_SUCCESS;
++	reply[1] = mmio->vfid;
++	reply[2] = FIELD_PREP(GUC_MMIO_RELAY_MAGIC, magic) |
++		   (err ? min_t(u32, -err, 255) : data[0]);
++	memcpy(reply + 3, data + 1, 3 * sizeof(u32));
++	len = err ? 3 : 6;
++	/* Never hold CT while waiting for the GPU or the PF configuration lock. */
++	for (retry = 0; retry < 50; retry++) {
++		mutex_lock(&ct->lock);
++		if (!pf_mmio_current(mmio)) {
++			mutex_unlock(&ct->lock);
++			goto done;
++		}
++		ret = xe_guc_ct_send_g2h_handler_nowait(ct, reply, len);
++		mutex_unlock(&ct->lock);
++		if (ret != -EBUSY)
++			break;
++		msleep(20);
++	}
++	xe_gt_sriov_info(gt, "MMIO relay VF%u opcode %#x magic %#x result %d data0 %u send %d\n",
++			 mmio->vfid, opcode, magic, err, data[0], ret);
++done:
++	xe_pm_runtime_put(xe);
++	atomic_set(&mmio->pending, 0);
++	if (ctb)
++		complete(&mmio->ctb_done);
++}
++
++int xe_gt_sriov_pf_service_process_mmio(struct xe_gt *gt, const u32 *msg, u32 len)
++{
++	struct xe_gt_sriov_pf_mmio *mmio;
++	u32 vfid;
++
++	if (!IS_SRIOV_PF(gt_to_xe(gt)) || !gt->sriov.pf.service.mmio_wq)
++		return -EOPNOTSUPP;
++	if (len != GUC_MMIO_RELAY_EVENT_LEN || (msg[2] & GUC_MMIO_RELAY_MBZ) ||
++	    FIELD_GET(GUC_HXG_MSG_0_ORIGIN, msg[0]) != GUC_HXG_ORIGIN_GUC ||
++	    FIELD_GET(GUC_HXG_MSG_0_TYPE, msg[0]) != GUC_HXG_TYPE_EVENT)
++		return -EPROTO;
++	vfid = msg[1];
++	if (!vfid || vfid > xe_gt_sriov_pf_get_totalvfs(gt))
++		return -EINVAL;
++	if (xe_gt_sriov_pf_control_flr_in_progress(gt, vfid))
++		return 0;
++	mmio = &gt->sriov.pf.vfs[vfid].mmio;
++	if (atomic_cmpxchg(&mmio->pending, 0, 1))
++		return 0;
++	mmio->ctb = false;
++	memcpy(mmio->msg, msg, sizeof(mmio->msg));
++	mmio->request_generation = atomic_read(&mmio->generation);
++	mmio->request_epoch = atomic_read(&gt->sriov.pf.service.mmio_epoch);
++	mmio->primary_epoch = atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch);
++	xe_gt_sriov_info(gt, "MMIO relay VF%u queued len %u msg %*ph\n",
++			 vfid, len, (int)sizeof(mmio->msg), msg);
++	queue_work(gt->sriov.pf.service.mmio_wq, &mmio->work);
++	return 0;
++}
++
++static int pf_process_update_ggtt_msg(struct xe_gt *gt, u32 origin,
++				      const u32 *msg, u32 len, u32 *response, u32 size)
++{
++	struct xe_gt_sriov_pf_mmio *mmio;
++	int generation, epoch, primary_epoch, ret;
++
++	if (!gt->sriov.pf.service.mmio_wq || MEDIA_VERx100(gt_to_xe(gt)) != 1300)
++		return -EOPNOTSUPP;
++	if (!origin || origin > xe_gt_sriov_pf_get_totalvfs(gt))
++		return -EINVAL;
++	if (!xe_sriov_pf_service_is_negotiated(gt_to_xe(gt), origin, 1, 0))
++		return -EACCES;
++	if (len < VF2PF_GGTT_REQUEST_MIN_LEN || (len & 1) ||
++	    len > GUC_RELAY_MSG_MAX_LEN ||
++	    FIELD_GET(GUC_HXG_REQUEST_MSG_0_DATA0, msg[0]))
++		return -EPROTO;
++	if (!size)
++		return -ENOBUFS;
++	mmio = &gt->sriov.pf.vfs[origin].mmio;
++	if (atomic_cmpxchg(&mmio->pending, 0, 1))
++		return -EINPROGRESS;
++	/* Use the same work item so FLR/release waits for both transports. */
++	mmio->ctb = true;
++	mmio->ctb_len = len;
++	memcpy(mmio->ctb_msg, msg, len * sizeof(u32));
++	mmio->request_generation = generation = atomic_read(&mmio->generation);
++	mmio->request_epoch = epoch = atomic_read(&gt->sriov.pf.service.mmio_epoch);
++	mmio->primary_epoch = primary_epoch =
++		atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch);
++	reinit_completion(&mmio->ctb_done);
++	queue_work(gt->sriov.pf.service.mmio_wq, &mmio->work);
++	/* Called by the relay worker, outside the CT and PF configuration locks. */
++	wait_for_completion(&mmio->ctb_done);
++	ret = mmio->ctb_result;
++	if (ret < 0)
++		return ret;
++	if (generation != atomic_read(&mmio->generation) ||
++	    epoch != atomic_read(&gt->sriov.pf.service.mmio_epoch) ||
++	    primary_epoch != atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch) ||
++	    xe_gt_sriov_pf_control_flr_in_progress(gt, origin) ||
++	    xe_gt_sriov_pf_control_flr_in_progress(gt->tile->primary_gt, origin))
++		return -ECANCELED;
++	response[0] = FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_HOST) |
++		      FIELD_PREP(GUC_HXG_MSG_0_TYPE, GUC_HXG_TYPE_RESPONSE_SUCCESS) |
++		      FIELD_PREP(GUC_HXG_RESPONSE_MSG_0_DATA0, ret);
++	return 1;
++}
++
+ static const struct xe_reg tgl_runtime_regs[] = {
+ 	RPM_CONFIG0,			/* _MMIO(0x0d00) */
+ 	MIRROR_FUSE3,			/* _MMIO(0x9118) */
+@@ -219,11 +546,34 @@ static void pf_prepare_runtime_info(struct xe_gt *gt)
+  */
+ int xe_gt_sriov_pf_service_init(struct xe_gt *gt)
+ {
++	struct xe_device *xe = gt_to_xe(gt);
++	u32 vfid;
+ 	int err;
+ 
+ 	err = pf_alloc_runtime_info(gt);
+ 	if (unlikely(err))
+ 		goto failed;
++	/* This experiment is restricted to MTL/ARL's shared descriptor. */
++	if (xe->info.platform == XE_METEORLAKE) {
++		gt->sriov.pf.service.mmio_wq =
++			drmm_alloc_ordered_workqueue(&xe->drm, "xe-pf-mmio", WQ_MEM_RECLAIM);
++		if (IS_ERR(gt->sriov.pf.service.mmio_wq)) {
++			err = PTR_ERR(gt->sriov.pf.service.mmio_wq);
++			gt->sriov.pf.service.mmio_wq = NULL;
++			goto failed;
++		}
++		atomic_set(&gt->sriov.pf.service.mmio_epoch, 0);
++		for (vfid = 1; vfid <= xe_gt_sriov_pf_get_totalvfs(gt); vfid++) {
++			struct xe_gt_sriov_pf_mmio *mmio = &gt->sriov.pf.vfs[vfid].mmio;
++
++			mmio->gt = gt;
++			mmio->vfid = vfid;
++			atomic_set(&mmio->pending, 0);
++			atomic_set(&mmio->generation, 0);
++			INIT_WORK(&mmio->work, pf_mmio_worker);
++			init_completion(&mmio->ctb_done);
++		}
++	}
+ 
+ 	return 0;
+ failed:
+@@ -390,6 +740,9 @@ int xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
+ 	case GUC_RELAY_ACTION_VF2PF_QUERY_RUNTIME:
+ 		ret = pf_process_runtime_query_msg(gt, origin, msg, msg_len, response, resp_size);
+ 		break;
++	case GUC_RELAY_ACTION_VF2PF_UPDATE_GGTT32:
++		ret = pf_process_update_ggtt_msg(gt, origin, msg, msg_len, response, resp_size);
++		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 		break;
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h
+index 10b02c9b6..c1905b008 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h
+@@ -18,10 +18,23 @@ void xe_gt_sriov_pf_service_update(struct xe_gt *gt);
+ int xe_gt_sriov_pf_service_print_runtime(struct xe_gt *gt, struct drm_printer *p);
+ 
+ #ifdef CONFIG_PCI_IOV
++int xe_gt_sriov_pf_service_process_mmio(struct xe_gt *gt, const u32 *msg, u32 len);
++void xe_gt_sriov_pf_service_stop_mmio(struct xe_gt *gt);
++void xe_gt_sriov_pf_service_flush_mmio(struct xe_gt *gt);
++void xe_gt_sriov_pf_service_reset_mmio_vf(struct xe_gt *gt, u32 vfid);
++bool xe_gt_sriov_pf_service_mmio_busy(struct xe_gt *gt, u32 vfid);
++void xe_gt_sriov_pf_service_flush_mmio_vf(struct xe_gt *gt, u32 vfid);
+ int xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
+ 					   const u32 *msg, u32 msg_len,
+ 					   u32 *response, u32 resp_size);
+ #else
++static inline int xe_gt_sriov_pf_service_process_mmio(struct xe_gt *gt,
++						   const u32 *msg, u32 len)
++{
++	return -EPROTO;
++}
++static inline void xe_gt_sriov_pf_service_stop_mmio(struct xe_gt *gt) { }
++static inline void xe_gt_sriov_pf_service_flush_mmio(struct xe_gt *gt) { }
+ static inline int
+ xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
+ 				       const u32 *msg, u32 msg_len,
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h
+index ad6dd75f0..3e475560a 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h
+@@ -7,8 +7,32 @@
+ #define _XE_GT_SRIOV_PF_SERVICE_TYPES_H_
+ 
+ #include <linux/types.h>
++#include <linux/atomic.h>
++#include <linux/workqueue.h>
++#include <linux/completion.h>
++
++#include "abi/guc_relay_communication_abi.h"
+ 
+ struct xe_reg;
++struct xe_gt;
++
++/* One outstanding GGTT/MMIO transaction per VF and GT. */
++struct xe_gt_sriov_pf_mmio {
++	struct work_struct work;
++	struct xe_gt *gt;
++	u32 vfid;
++	u32 msg[6];
++	u32 ctb_msg[GUC_RELAY_MSG_MAX_LEN];
++	u32 ctb_len;
++	bool ctb;
++	struct completion ctb_done;
++	int ctb_result;
++	atomic_t pending;
++	atomic_t generation;
++	int request_generation;
++	int request_epoch;
++	int primary_epoch;
++};
+ 
+ /**
+  * struct xe_gt_sriov_pf_service_version - VF/PF ABI Version.
+@@ -47,6 +71,8 @@ struct xe_gt_sriov_pf_service {
+ 		struct xe_gt_sriov_pf_service_version latest;
+ 	} version;
+ 	struct xe_gt_sriov_pf_service_runtime_regs runtime;
++	struct workqueue_struct *mmio_wq;
++	atomic_t mmio_epoch;
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h
+index 6296483c4..ae3a5e839 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h
+@@ -33,6 +33,8 @@ struct xe_gt_sriov_metadata {
+ 
+ 	/** @migration: per-VF migration data. */
+ 	struct xe_gt_sriov_migration_data migration;
++	/** @mmio: legacy MMIO VF/PF transaction state. */
++	struct xe_gt_sriov_pf_mmio mmio;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct.c b/drivers/gpu/drm/xe/xe_guc_ct.c
+index 21e0dad9a..154f39e53 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct.c
++++ b/drivers/gpu/drm/xe/xe_guc_ct.c
+@@ -16,6 +16,7 @@
+ 
+ #include "abi/guc_actions_abi.h"
+ #include "abi/guc_actions_sriov_abi.h"
++#include "abi/guc_mmio_relay_abi.h"
+ #include "abi/guc_klvs_abi.h"
+ #include "xe_bo.h"
+ #include "xe_devcoredump.h"
+@@ -24,6 +25,7 @@
+ #include "xe_gt_printk.h"
+ #include "xe_gt_sriov_pf_control.h"
+ #include "xe_gt_sriov_pf_monitor.h"
++#include "xe_gt_sriov_pf_service.h"
+ #include "xe_guc.h"
+ #include "xe_guc_log.h"
+ #include "xe_guc_pagefault.h"
+@@ -726,6 +728,7 @@ static void stop_g2h_handler(struct xe_guc_ct *ct)
+ void xe_guc_ct_disable(struct xe_guc_ct *ct)
+ {
+ 	guc_ct_change_state(ct, XE_GUC_CT_STATE_DISABLED);
++	xe_gt_sriov_pf_service_stop_mmio(ct_to_gt(ct));
+ 	ct_exit_safe_mode(ct);
+ 	stop_g2h_handler(ct);
+ }
+@@ -752,6 +755,7 @@ void xe_guc_ct_stop(struct xe_guc_ct *ct)
+ 		return;
+ 
+ 	guc_ct_change_state(ct, XE_GUC_CT_STATE_STOPPED);
++	xe_gt_sriov_pf_service_stop_mmio(ct_to_gt(ct));
+ 	stop_g2h_handler(ct);
+ }
+ 
+@@ -1273,6 +1277,13 @@ int xe_guc_ct_send_g2h_handler(struct xe_guc_ct *ct, const u32 *action, u32 len)
+ 	return ret;
+ }
+ 
++/* No nested G2H processing: callers may need to revalidate a VF generation. */
++int xe_guc_ct_send_g2h_handler_nowait(struct xe_guc_ct *ct, const u32 *action, u32 len)
++{
++	lockdep_assert_held(&ct->lock);
++	return __guc_ct_send_locked(ct, action, len, 0, 0, NULL);
++}
++
+ /*
+  * Check if a GT reset is in progress or will occur and if GT reset brought the
+  * CT back up. Randomly picking 5 seconds for an upper limit to do a GT a reset.
+@@ -1682,6 +1693,14 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+ 	case GUC_ACTION_GUC2PF_ADVERSE_EVENT:
+ 		ret = xe_gt_sriov_pf_monitor_process_guc2pf(gt, hxg, hxg_len);
+ 		break;
++	case GUC_ACTION_GUC2PF_MMIO_RELAY_SERVICE:
++		ret = xe_gt_sriov_pf_service_process_mmio(gt, hxg, hxg_len);
++		if (ret)
++			xe_gt_err(gt, "MMIO relay rejected (%pe) len %u msg %*ph\n",
++				  ERR_PTR(ret), hxg_len, (int)sizeof(u32) * hxg_len, hxg);
++		/* A malformed VF request must not mark the PF CT channel dead. */
++		ret = 0;
++		break;
+ 	case XE_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED:
+ 	case XE_GUC_ACTION_NOTIFY_EXCEPTION:
+ 		ret = guc_crash_process_msg(ct, action);
+diff --git a/drivers/gpu/drm/xe/xe_guc_ct.h b/drivers/gpu/drm/xe/xe_guc_ct.h
+index 767365a33..a197a0c3c 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ct.h
++++ b/drivers/gpu/drm/xe/xe_guc_ct.h
+@@ -66,6 +66,7 @@ xe_guc_ct_send_block(struct xe_guc_ct *ct, const u32 *action, u32 len)
+ /* This is only version of the send CT you can call from a G2H handler */
+ int xe_guc_ct_send_g2h_handler(struct xe_guc_ct *ct, const u32 *action,
+ 			       u32 len);
++int xe_guc_ct_send_g2h_handler_nowait(struct xe_guc_ct *ct, const u32 *action, u32 len);
+ 
+ /* Can't fail because a GT reset is in progress */
+ int xe_guc_ct_send_recv_no_fail(struct xe_guc_ct *ct, const u32 *action,
+diff --git a/drivers/gpu/drm/xe/xe_migrate.c b/drivers/gpu/drm/xe/xe_migrate.c
+index be787f331..d01c900b3 100644
+--- a/drivers/gpu/drm/xe/xe_migrate.c
++++ b/drivers/gpu/drm/xe/xe_migrate.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "xe_migrate.h"
++#include "abi/guc_ggtt_relay_abi.h"
+ 
+ #include <linux/bitfield.h>
+ #include <linux/sizes.h>
+@@ -840,6 +841,58 @@ static u64 xe_migrate_batch_base(struct xe_migrate *m, bool usm)
+ 	return usm ? m->usm_batch_base_ofs : m->batch_base_ofs;
+ }
+ 
++/* Media 13 VF mappings must be updated by the PF command streamer. */
++struct dma_fence *xe_migrate_update_ggtt(struct xe_migrate *m, u32 offset,
++				     const u64 *ptes, u32 count)
++{
++	struct xe_gt *gt = m->tile->primary_gt;
++	struct xe_sched_job *job;
++	struct dma_fence *fence;
++	struct xe_bb *bb;
++	u32 i = 0, n, j;
++
++	if (!count || count > VF2PF_GGTT_MAX_EXPANDED_PTES ||
++	    !IS_ALIGNED(offset, XE_PAGE_SIZE) ||
++	    (u64)offset + (u64)count * XE_PAGE_SIZE > GUC_GGTT_TOP)
++		return ERR_PTR(-EINVAL);
++
++	/* 511 entries per command: 512 triggers a reset in the i915 reference. */
++	bb = xe_bb_new(gt, 1 + 2 * count + 2 * DIV_ROUND_UP(count, 511), false);
++	if (IS_ERR(bb))
++		return ERR_CAST(bb);
++
++	/* Use the existing two-batch migration ring path, with an empty first BB. */
++	bb->cs[bb->len++] = MI_BATCH_BUFFER_END;
++	while (i < count) {
++		n = min_t(u32, 511, count - i);
++		bb->cs[bb->len++] = MI_UPDATE_GTT | (2 * n);
++		bb->cs[bb->len++] = offset + i * XE_PAGE_SIZE;
++		for (j = 0; j < n; j++, i++) {
++			bb->cs[bb->len++] = lower_32_bits(ptes[i]);
++			bb->cs[bb->len++] = upper_32_bits(ptes[i]);
++		}
++	}
++
++	/* MI_UPDATE_GTT is privileged: execute the kernel BB from the PF GGTT. */
++	job = xe_bb_create_migration_job(m->q, bb,
++				       xe_sa_manager_gpu_addr(m->tile->mem.kernel_bb_pool), 1);
++	if (IS_ERR(job)) {
++		xe_bb_free(bb, NULL);
++		return ERR_CAST(job);
++	}
++	job->ggtt = true;
++	xe_sched_job_add_migrate_flush(job, MI_INVALIDATE_TLB);
++	mutex_lock(&m->job_mutex);
++	xe_sched_job_arm(job);
++	fence = dma_fence_get(&job->drm.s_fence->finished);
++	xe_sched_job_push(job);
++	dma_fence_put(m->fence);
++	m->fence = dma_fence_get(fence);
++	mutex_unlock(&m->job_mutex);
++	xe_bb_free(bb, fence);
++	return fence;
++}
++
+ static u32 xe_migrate_ccs_copy(struct xe_migrate *m,
+ 			       struct xe_bb *bb,
+ 			       u64 src_ofs, bool src_is_indirect,
+diff --git a/drivers/gpu/drm/xe/xe_migrate.h b/drivers/gpu/drm/xe/xe_migrate.h
+index c3a268b01..29b54fd81 100644
+--- a/drivers/gpu/drm/xe/xe_migrate.h
++++ b/drivers/gpu/drm/xe/xe_migrate.h
+@@ -165,6 +165,9 @@ struct dma_fence *xe_migrate_clear(struct xe_migrate *m,
+ 
+ struct xe_vm *xe_migrate_get_vm(struct xe_migrate *m);
+ 
++struct dma_fence *xe_migrate_update_ggtt(struct xe_migrate *m, u32 offset,
++				     const u64 *ptes, u32 count);
++
+ struct dma_fence *
+ xe_migrate_update_pgtables(struct xe_migrate *m,
+ 			   struct xe_migrate_pt_update *pt_update);
+diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
+index 9cd873708..65a2cd84f 100644
+--- a/drivers/gpu/drm/xe/xe_pci.c
++++ b/drivers/gpu/drm/xe/xe_pci.c
+@@ -373,6 +373,7 @@ static const struct xe_device_desc mtl_desc = {
+ 	PLATFORM(METEORLAKE),
+ 	.dma_mask_size = 46,
+ 	.has_display = true,
++	.has_sriov = true,
+ 	.has_pxp = true,
+ 	.max_gt_per_tile = 2,
+ 	MULTI_LRC_MASK,
+diff --git a/drivers/gpu/drm/xe/xe_ring_ops.c b/drivers/gpu/drm/xe/xe_ring_ops.c
+index 08b4a4283..336d463dc 100644
+--- a/drivers/gpu/drm/xe/xe_ring_ops.c
++++ b/drivers/gpu/drm/xe/xe_ring_ops.c
+@@ -513,6 +513,7 @@ static void emit_migration_job_gen12(struct xe_sched_job *job,
+ 	struct xe_device *xe = gt_to_xe(gt);
+ 	u32 saddr = xe_lrc_start_seqno_ggtt_addr(lrc);
+ 	u32 dw[MAX_JOB_SIZE_DW], i = 0;
++	u32 ppgtt_flag = job->ggtt ? 0 : BIT(8);
+ 
+ 	*head = lrc->ring.tail;
+ 
+@@ -524,13 +525,13 @@ static void emit_migration_job_gen12(struct xe_sched_job *job,
+ 
+ 	dw[i++] = MI_ARB_ON_OFF | MI_ARB_DISABLE; /* Enabled again below */
+ 
+-	i = emit_bb_start(job->ptrs[0].batch_addr, BIT(8), dw, i);
++	i = emit_bb_start(job->ptrs[0].batch_addr, ppgtt_flag, dw, i);
+ 
+ 	dw[i++] = preparser_disable(true);
+ 	i = emit_flush_invalidate(saddr, seqno, job->migrate_flush_flags, dw, i);
+ 	dw[i++] = preparser_disable(false);
+ 
+-	i = emit_bb_start(job->ptrs[1].batch_addr, BIT(8), dw, i);
++	i = emit_bb_start(job->ptrs[1].batch_addr, ppgtt_flag, dw, i);
+ 
+ 	i = emit_flush_imm_ggtt(xe_lrc_seqno_ggtt_addr(lrc), seqno,
+ 				job->migrate_flush_flags,
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval.c b/drivers/gpu/drm/xe/xe_tlb_inval.c
+index bbd21d393..d0c4edd4d 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval.c
++++ b/drivers/gpu/drm/xe/xe_tlb_inval.c
+@@ -317,6 +317,9 @@ int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval)
+ 	xe_tlb_inval_fence_init(tlb_inval, fence_ptr, true);
+ 	ret = xe_tlb_inval_issue(tlb_inval, fence_ptr, tlb_inval->ops->ggtt);
+ 	xe_tlb_inval_fence_wait(fence_ptr);
++	/* Do not acknowledge a VF mapping after a timed out invalidation. */
++	if (!ret && dma_fence_get_status(&fence_ptr->base) < 0)
++		ret = dma_fence_get_status(&fence_ptr->base);
+ 
+ 	return ret;
+ }
