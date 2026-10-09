@@ -1,6 +1,6 @@
 diff --git a/drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h b/drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h
 new file mode 100644
-index 000000000..b442278f5
+index 0000000000000000000000000000000000000000..b442278f5a048ec34263c04c3a93b0bb9c5cc45e
 --- /dev/null
 +++ b/drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h
 @@ -0,0 +1,18 @@
@@ -24,7 +24,7 @@ index 000000000..b442278f5
 +#endif
 diff --git a/drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h b/drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h
 new file mode 100644
-index 000000000..f67803880
+index 0000000000000000000000000000000000000000..f678038807e06194e53b5a37791451d410529870
 --- /dev/null
 +++ b/drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h
 @@ -0,0 +1,30 @@
@@ -59,7 +59,7 @@ index 000000000..f67803880
 +
 +#endif
 diff --git a/drivers/gpu/drm/xe/instructions/xe_mi_commands.h b/drivers/gpu/drm/xe/instructions/xe_mi_commands.h
-index ad7d98f2d..d3f7ffc2e 100644
+index ad7d98f2dbbaf76d0a97fde3dd266c1bbe7f5330..d3f7ffc2e6d274f5f3e3980e0010db0deffdeb1a 100644
 --- a/drivers/gpu/drm/xe/instructions/xe_mi_commands.h
 +++ b/drivers/gpu/drm/xe/instructions/xe_mi_commands.h
 @@ -55,6 +55,7 @@
@@ -71,7 +71,7 @@ index ad7d98f2d..d3f7ffc2e 100644
  #define   MI_LRI_MMIO_REMAP_EN		REG_BIT(17)
  #define   MI_LRI_NUM_REGS(x)		XE_INSTR_NUM_DW(2 * (x) + 1)
 diff --git a/drivers/gpu/drm/xe/xe_ggtt.c b/drivers/gpu/drm/xe/xe_ggtt.c
-index a351c578b..eb301e6a3 100644
+index a351c578b17055b31d03f5cbf8ba06a71590c624..d37de997a2b8c47bf244de8d8ecc4cce97704ed5 100644
 --- a/drivers/gpu/drm/xe/xe_ggtt.c
 +++ b/drivers/gpu/drm/xe/xe_ggtt.c
 @@ -4,6 +4,7 @@
@@ -82,15 +82,24 @@ index a351c578b..eb301e6a3 100644
  
  #include <kunit/visibility.h>
  #include <linux/fault-inject.h>
-@@ -24,6 +25,7 @@
+@@ -24,6 +25,8 @@
  #include "xe_gt_types.h"
  #include "xe_map.h"
  #include "xe_mmio.h"
 +#include "xe_migrate.h"
++#include "xe_module.h"
  #include "xe_pat.h"
  #include "xe_pm.h"
  #include "xe_res_cursor.h"
-@@ -940,6 +942,72 @@ u64 xe_ggtt_largest_hole(struct xe_ggtt *ggtt, u64 alignment, u64 *spare)
+@@ -31,6 +34,7 @@
+ #include "xe_tile_printk.h"
+ #include "xe_tile_sriov_vf.h"
+ #include "xe_tlb_inval.h"
++#include "xe_trace.h"
+ #include "xe_wa.h"
+ #include "xe_wopcm.h"
+ 
+@@ -940,6 +944,72 @@ u64 xe_ggtt_largest_hole(struct xe_ggtt *ggtt, u64 alignment, u64 *spare)
  }
  
  #ifdef CONFIG_PCI_IOV
@@ -149,47 +158,412 @@ index a351c578b..eb301e6a3 100644
 +	return fence;
 +}
 +
-+int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt)
++int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt, const struct xe_sriov_vf_trace *trace)
 +{
 +	int err;
 +
 +	xe_mmio_read32(xe_root_tile_mmio(tile_to_xe(ggtt->tile)), VF_CAP_REG);
-+	err = xe_tlb_inval_ggtt(&ggtt->tile->primary_gt->tlb_inval);
++	err = xe_tlb_inval_ggtt_vf(&ggtt->tile->primary_gt->tlb_inval, trace);
 +	if (!err && ggtt->tile->media_gt)
-+		err = xe_tlb_inval_ggtt(&ggtt->tile->media_gt->tlb_inval);
++		err = xe_tlb_inval_ggtt_vf(&ggtt->tile->media_gt->tlb_inval, trace);
 +	return err;
 +}
 +
  static u64 xe_encode_vfid_pte(u16 vfid)
  {
  	return FIELD_PREP(GGTT_PTE_VFID, vfid) | XE_PAGE_PRESENT;
+@@ -963,6 +1033,70 @@ static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
+ 	xe_ggtt_invalidate(ggtt);
+ }
+ 
++/*
++ * i915 uses its GPU binder to assign VF ownership on Media 13. Keep the
++ * existing PTE contents (owner, present, physical address zero), but test the
++ * same command-streamer path instead of CPU stores on MTL/ARL. This also
++ * covers sanitizing the VF region after FLR; it is not a texture flush.
++ */
++static int xe_ggtt_assign_gpu(const struct xe_ggtt_node *node, u16 vfid,
++			    u32 *completed)
++{
++	struct xe_ggtt *ggtt = node->ggtt;
++	struct xe_gt *gt = ggtt->tile->primary_gt;
++	u64 start = xe_ggtt_node_addr(node);
++	u32 count = xe_ggtt_node_size(node) / XE_PAGE_SIZE;
++	struct xe_sriov_vf_trace trace = {
++		.vfid = vfid,
++		.gt_id = gt->info.id,
++		.offset = start / XE_PAGE_SIZE,
++		.count = count,
++	};
++	struct dma_fence *fence;
++	u64 *ptes;
++	u32 n;
++	int err = 0;
++
++	if (!ggtt->tile->migrate)
++		return -ENODEV;
++
++	/* Match the i915 binder's limit and fence each chunk before reusing it. */
++	ptes = kmalloc_array(511, sizeof(*ptes), GFP_KERNEL);
++	if (!ptes)
++		return -ENOMEM;
++	memset64(ptes, xe_encode_vfid_pte(vfid), 511);
++
++	while (*completed < count) {
++		n = min_t(u32, 511, count - *completed);
++		fence = xe_migrate_update_ggtt(ggtt->tile->migrate,
++					     start + (u64)*completed * XE_PAGE_SIZE,
++					     ptes, n);
++		if (IS_ERR(fence)) {
++			err = PTR_ERR(fence);
++			break;
++		}
++
++		/*
++		 * Do not release/reuse this GGTT node while its writer is pending.
++		 * The scheduler handles hung jobs and signals their error fences.
++		 */
++		err = dma_fence_wait(fence, false);
++		if (!err) {
++			err = dma_fence_get_status(fence);
++			err = err > 0 ? 0 : err ?: -EIO;
++		}
++		dma_fence_put(fence);
++		if (err)
++			break;
++		*completed += n;
++	}
++	kfree(ptes);
++
++	if (!err)
++		err = xe_ggtt_invalidate_vf(ggtt, &trace);
++	return err;
++}
++
+ /**
+  * xe_ggtt_assign - assign a GGTT region to the VF
+  * @node: the &xe_ggtt_node to update
+@@ -971,11 +1105,47 @@ static void xe_ggtt_assign_locked(const struct xe_ggtt_node *node, u16 vfid)
+  * This function is used by the PF driver to assign a GGTT region to the VF.
+  * In addition to PTE's VFID bits 11:2 also PRESENT bit 0 is set as on some
+  * platforms VFs can't modify that either.
++ *
++ * Return: 0 on success, or an error before the region is published to GuC.
+  */
+-void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid)
++int xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid)
+ {
+-	guard(mutex)(&node->ggtt->lock);
+-	xe_ggtt_assign_locked(node, vfid);
++	struct xe_gt *gt = node->ggtt->tile->primary_gt;
++	struct xe_device *xe = gt_to_xe(gt);
++	u64 start = xe_ggtt_node_addr(node);
++	u64 size = xe_ggtt_node_size(node);
++	bool gpu = xe_modparam.mtl_sriov_gpu_assign && IS_SRIOV_PF(xe) &&
++		   GRAPHICS_VERx100(xe) >= 1270 && GRAPHICS_VERx100(xe) <= 1274 &&
++		   MEDIA_VER(xe) == 13;
++	u32 completed = 0;
++	int err = 0;
++
++	if (!vfid || !FIELD_FIT(GGTT_PTE_VFID, vfid) || !size ||
++	    !IS_ALIGNED(start, XE_PAGE_SIZE) || !IS_ALIGNED(size, XE_PAGE_SIZE) ||
++	    start >= GUC_GGTT_TOP || size > GUC_GGTT_TOP - start)
++		return -EINVAL;
++
++	trace_xe_sriov_ggtt_assign(gt, vfid, start, size, gpu, false, 0, 0);
++	/*
++	 * Callers hold the PF configuration mutex and keep the node alive.
++	 * GPU waits must not hold the GGTT allocator mutex needed by recovery
++	 * and other PF allocations. The command-streamer service uses the same
++	 * lifetime discipline for VF updates.
++	 */
++	if (gpu)
++		err = xe_ggtt_assign_gpu(node, vfid, &completed);
++	else {
++		guard(mutex)(&node->ggtt->lock);
++
++		xe_ggtt_assign_locked(node, vfid);
++		completed = size / XE_PAGE_SIZE;
++	}
++	trace_xe_sriov_ggtt_assign(gt, vfid, start, size, gpu, true, completed, err);
++	if (gpu)
++		xe_gt_info(gt,
++			   "VF%u GGTT GPU owner assignment: start=%#llx size=%#llx completed=%u result=%d\n",
++			   vfid, start, size, completed, err);
++	return err;
+ }
+ 
+ /**
 diff --git a/drivers/gpu/drm/xe/xe_ggtt.h b/drivers/gpu/drm/xe/xe_ggtt.h
-index c864cc975..c9127aa94 100644
+index c864cc975a695698fce26fc4028968f9e3af0929..3c4fe32dedba92031990cfc327484613229b513b 100644
 --- a/drivers/gpu/drm/xe/xe_ggtt.h
 +++ b/drivers/gpu/drm/xe/xe_ggtt.h
-@@ -12,6 +12,7 @@ struct drm_printer;
+@@ -12,6 +12,8 @@ struct drm_printer;
  struct xe_bo;
  struct xe_tile;
  struct drm_exec;
 +struct dma_fence;
++struct xe_sriov_vf_trace;
  
  struct xe_ggtt *xe_ggtt_alloc(struct xe_tile *tile);
  int xe_ggtt_init_early(struct xe_ggtt *ggtt);
-@@ -42,6 +43,12 @@ int xe_ggtt_dump(struct xe_ggtt *ggtt, struct drm_printer *p);
+@@ -42,7 +44,13 @@ int xe_ggtt_dump(struct xe_ggtt *ggtt, struct drm_printer *p);
  u64 xe_ggtt_print_holes(struct xe_ggtt *ggtt, u64 alignment, struct drm_printer *p);
  
  #ifdef CONFIG_PCI_IOV
+-void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid);
 +struct dma_fence *xe_ggtt_update_vf(struct xe_ggtt_node *node, u16 vfid,
 +				 u32 offset, u8 mode, u16 copies, u64 pte);
 +struct dma_fence *xe_ggtt_update_vf_ptes(struct xe_ggtt_node *node, u16 vfid,
 +				      u32 offset, u8 mode, u16 copies,
 +				      const u64 *input, u32 count);
-+int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt);
- void xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid);
++int xe_ggtt_invalidate_vf(struct xe_ggtt *ggtt, const struct xe_sriov_vf_trace *trace);
++int xe_ggtt_assign(const struct xe_ggtt_node *node, u16 vfid);
  int xe_ggtt_node_save(struct xe_ggtt_node *node, void *dst, size_t size, u16 vfid);
  int xe_ggtt_node_load(struct xe_ggtt_node *node, const void *src, size_t size, u16 vfid);
+ #endif
+diff --git a/drivers/gpu/drm/xe/xe_gt_debugfs.c b/drivers/gpu/drm/xe/xe_gt_debugfs.c
+index c38bcacb27e4a3bd6ff659a60daf689d5d90cc39..05652a608e98395d0d4495262fd124215c301ef8 100644
+--- a/drivers/gpu/drm/xe/xe_gt_debugfs.c
++++ b/drivers/gpu/drm/xe/xe_gt_debugfs.c
+@@ -6,16 +6,23 @@
+ #include "xe_gt_debugfs.h"
+ 
+ #include <linux/debugfs.h>
++#include <linux/ktime.h>
+ 
+ #include <drm/drm_debugfs.h>
+ #include <drm/drm_managed.h>
+ 
++#include "regs/xe_engine_regs.h"
++#include "regs/xe_gtt_defs.h"
++#include "regs/xe_gt_regs.h"
++
+ #include "xe_device.h"
+ #include "xe_force_wake.h"
++#include "xe_ggtt.h"
+ #include "xe_gt.h"
+ #include "xe_gt_mcr.h"
+ #include "xe_gt_idle.h"
+ #include "xe_gt_sriov_pf_debugfs.h"
++#include "xe_gt_sriov_pf_helpers.h"
+ #include "xe_gt_sriov_vf_debugfs.h"
+ #include "xe_gt_stats.h"
+ #include "xe_gt_topology.h"
+@@ -23,6 +30,7 @@
+ #include "xe_hw_engine.h"
+ #include "xe_lrc.h"
+ #include "xe_mocs.h"
++#include "xe_mmio.h"
+ #include "xe_pat.h"
+ #include "xe_pm.h"
+ #include "xe_reg_sr.h"
+@@ -130,6 +138,60 @@ static int steering(struct xe_gt *gt, struct drm_printer *p)
+ 	return 0;
+ }
+ 
++/* Shared GT/engine programming, not a snapshot of a Windows VF context. */
++static int mtl_sriov_cache_state(struct xe_gt *gt, struct drm_printer *p)
++{
++	static const struct {
++		const char *name;
++		struct xe_reg_mcr reg;
++		u32 mask;
++		u32 i915_expected;
++	} regs[] = {
++		{ "BLEND_FILL_CACHING_OPT_DIS", XEHP_L3SCQREG7,
++		  BLEND_FILL_CACHING_OPT_DIS, BLEND_FILL_CACHING_OPT_DIS },
++		{ "EN_32B_ACCESS", XEHP_SQCM, EN_32B_ACCESS, EN_32B_ACCESS },
++		/* i915 STACKID_CTRL_512 = FIELD_PREP(GENMASK(6, 5), 2). */
++		{ "STACKID_CTRL", RT_CTRL, REG_GENMASK(6, 5),
++		  REG_FIELD_PREP(REG_GENMASK(6, 5), 2) },
++		{ "INDIRECT_STATE_BASE_ADDR_OVERRIDE", SAMPLER_MODE,
++		  INDIRECT_STATE_BASE_ADDR_OVERRIDE,
++		  INDIRECT_STATE_BASE_ADDR_OVERRIDE },
++		{ "DIS_FIX_EOT1_FLUSH", ROW_CHICKEN3,
++		  DIS_FIX_EOT1_FLUSH, DIS_FIX_EOT1_FLUSH },
++		{ "DISABLE_TDL_SVHS_GATING", ROW_CHICKEN2,
++		  DISABLE_TDL_SVHS_GATING, DISABLE_TDL_SVHS_GATING },
++		{ "FORCE_MISS_FTLB", COMP_MOD_CTRL,
++		  FORCE_MISS_FTLB, FORCE_MISS_FTLB },
++		{ "ENFORCE_RAR", SQCNT1, ENFORCE_RAR, ENFORCE_RAR },
++	};
++	struct xe_device *xe = gt_to_xe(gt);
++	unsigned int i;
++
++	if (!IS_SRIOV_PF(xe) || xe_gt_is_media_type(gt) ||
++	    GRAPHICS_VERx100(xe) < 1270 || GRAPHICS_VERx100(xe) > 1274)
++		return -ENODEV;
++
++	CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FORCEWAKE_ALL);
++	if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FORCEWAKE_ALL))
++		return -ETIMEDOUT;
++
++	drm_printf(p, "gt=%u gfx=%u scope=shared-pf-gt-engine\n",
++		   gt->info.id, GRAPHICS_VERx100(xe));
++	drm_printf(p, "Sequential MCR reads; one valid instance per register.\n");
++	drm_printf(p, "Not VF context state or cache contents.\n");
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		u32 value = xe_gt_mcr_unicast_read_any(gt, regs[i].reg);
++
++		drm_printf(p, "%s reg=%#x val=%#x mask=%#x got=%#x i915=%#x match=%s\n",
++			   regs[i].name, regs[i].reg.__reg.addr, value,
++			   regs[i].mask, value & regs[i].mask,
++			   regs[i].i915_expected,
++			   str_yes_no((value & regs[i].mask) == regs[i].i915_expected));
++	}
++
++	return 0;
++}
++
+ static int register_save_restore(struct xe_gt *gt, struct drm_printer *p)
+ {
+ 	struct xe_hw_engine *hwe;
+@@ -157,6 +219,131 @@ static int register_save_restore(struct xe_gt *gt, struct drm_printer *p)
+ 	return 0;
+ }
+ 
++struct mtl_sriov_render_identity {
++	u32 lrca;
++	u64 status;
++	u64 pte;
++	u32 range_vf;
++};
++
++static struct mtl_sriov_render_identity
++mtl_sriov_render_identity(struct xe_hw_engine *hwe)
++{
++	struct xe_gt *gt = hwe->gt;
++	struct xe_ggtt *ggtt = gt->tile->mem.ggtt;
++	struct mtl_sriov_render_identity id = {};
++	unsigned int n, total = xe_gt_sriov_pf_get_totalvfs(gt);
++
++	id.lrca = xe_hw_engine_mmio_read32(hwe, RING_CURRENT_LRCA(0));
++	id.status = xe_mmio_read64_2x32(&gt->mmio,
++				      RING_EXECLIST_STATUS_LO(hwe->mmio_base));
++	/* Zero may be power-gated/idle. Do not assign it to a VF or read page 0. */
++	if (!id.lrca || !IS_ALIGNED(id.lrca, XE_PAGE_SIZE) || id.lrca >= GUC_GGTT_TOP)
++		return id;
++
++	/* Protect provisioning metadata, not hardware context switching. */
++	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
++	for (n = 1; n <= total; n++) {
++		const struct xe_ggtt_node *node = gt->sriov.pf.vfs[n].config.ggtt_region;
++		u64 start, size;
++
++		if (!node)
++			continue;
++		start = xe_ggtt_node_addr(node);
++		size = xe_ggtt_node_size(node);
++		if (id.lrca >= start && id.lrca - start < size) {
++			id.range_vf = n;
++			break;
++		}
++	}
++	id.pte = xe_ggtt_read_pte(ggtt, id.lrca);
++	return id;
++}
++
++static void mtl_sriov_render_identity_print(struct drm_printer *p,
++					  const char *phase, struct xe_hw_engine *hwe,
++					  const struct mtl_sriov_render_identity *id)
++{
++	drm_printf(p, "%s engine=%s lrca=%#x status=%#llx range_vf=%u ",
++		   phase, hwe->name, id->lrca, id->status, id->range_vf);
++	drm_printf(p, "pte=%#llx pte_present=%u pte_owner=%llu\n", id->pte,
++		   !!(id->pte & XE_PAGE_PRESENT), u64_get_bits(id->pte, GGTT_PTE_VFID));
++}
++
++/* Observational bracket only: equality cannot exclude a switch away and back. */
++static int mtl_sriov_render_state(struct xe_gt *gt, struct drm_printer *p)
++{
++	static const struct {
++		const char *name;
++		struct xe_reg_mcr reg;
++		u32 mask;
++	} regs[] = {
++		{ "MSAA_OPTIMIZATION_REDUC_DISABLE", CACHE_MODE_1,
++		  MSAA_OPTIMIZATION_REDUC_DISABLE },
++		{ "FD_END_COLLECT", XEHP_PSS_CHICKEN, FD_END_COLLECT },
++		{ "DISABLE_STATE_CACHE_PERF_FIX", XEHP_COMMON_SLICE_CHICKEN3,
++		  DISABLE_STATE_CACHE_PERF_FIX },
++		{ "L3_PWM_TIMER_INIT_VAL", XEHP_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK },
++	};
++	struct xe_device *xe = gt_to_xe(gt);
++	struct xe_hw_engine *rcs = &gt->hw_engines[XE_HW_ENGINE_RCS0];
++	struct xe_hw_engine *bcs = &gt->hw_engines[XE_HW_ENGINE_BCS0];
++	struct mtl_sriov_render_identity before[2], after[2];
++	u32 values[ARRAY_SIZE(regs)], lncf[8], nonpriv[RING_MAX_NONPRIV_SLOTS];
++	u64 start_ns, end_ns;
++	unsigned int i;
++	bool bracket_equal, owner_matches;
++
++	if (!IS_SRIOV_PF(xe) || xe_gt_is_media_type(gt) ||
++	    GRAPHICS_VERx100(xe) < 1270 || GRAPHICS_VERx100(xe) > 1274 ||
++	    !xe_hw_engine_is_valid(rcs) || !xe_hw_engine_is_valid(bcs))
++		return -ENODEV;
++
++	CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FORCEWAKE_ALL);
++	if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FORCEWAKE_ALL))
++		return -ETIMEDOUT;
++
++	start_ns = ktime_get_ns();
++	before[0] = mtl_sriov_render_identity(rcs);
++	before[1] = mtl_sriov_render_identity(bcs);
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		values[i] = xe_gt_mcr_unicast_read_any(gt, regs[i].reg);
++	for (i = 0; i < ARRAY_SIZE(lncf); i++)
++		lncf[i] = xe_gt_mcr_unicast_read_any(gt, XEHP_LNCFCMOCS(i));
++	for (i = 0; i < ARRAY_SIZE(nonpriv); i++)
++		nonpriv[i] = xe_hw_engine_mmio_read32(rcs, RING_FORCE_TO_NONPRIV(0, i));
++	after[1] = mtl_sriov_render_identity(bcs);
++	after[0] = mtl_sriov_render_identity(rcs);
++	end_ns = ktime_get_ns();
++
++	bracket_equal = before[0].lrca && before[0].lrca == after[0].lrca &&
++		before[0].status == after[0].status && before[0].pte == after[0].pte &&
++		before[0].range_vf == after[0].range_vf;
++	owner_matches = before[0].range_vf && (before[0].pte & XE_PAGE_PRESENT) &&
++		before[0].range_vf == u64_get_bits(before[0].pte, GGTT_PTE_VFID);
++	drm_printf(p, "gt=%u gfx=%u start_ns=%llu end_ns=%llu ",
++		   gt->info.id, GRAPHICS_VERx100(xe), start_ns, end_ns);
++	drm_printf(p, "rcs_bracket_equal=%u rcs_owner_matches=%u\n",
++		   bracket_equal, owner_matches);
++	drm_puts(p, "Sequential reads, one valid MCR instance; no context pause.\n");
++	drm_puts(p, "Equal brackets do not exclude an ABA switch or prove VF execution.\n");
++	mtl_sriov_render_identity_print(p, "before", rcs, &before[0]);
++	mtl_sriov_render_identity_print(p, "before", bcs, &before[1]);
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		drm_printf(p, "%s reg=%#x val=%#x mask=%#x got=%#x\n",
++			   regs[i].name, regs[i].reg.__reg.addr, values[i],
++			   regs[i].mask, values[i] & regs[i].mask);
++	for (i = 0; i < ARRAY_SIZE(lncf); i++)
++		drm_printf(p, "LNCF%u reg=%#x val=%#x\n", i,
++			   XEHP_LNCFCMOCS(i).__reg.addr, lncf[i]);
++	for (i = 0; i < ARRAY_SIZE(nonpriv); i++)
++		drm_printf(p, "NONPRIV%u reg=%#x val=%#x\n", i,
++			   RING_FORCE_TO_NONPRIV(rcs->mmio_base, i).addr, nonpriv[i]);
++	mtl_sriov_render_identity_print(p, "after", bcs, &after[1]);
++	mtl_sriov_render_identity_print(p, "after", rcs, &after[0]);
++	return 0;
++}
++
+ /*
+  * Check the registers referenced on a save-restore list and report any
+  * save-restore entries that did not get applied.
+@@ -241,6 +428,10 @@ static const struct drm_info_list vf_safe_debugfs_list[] = {
+ 
+ /* everything else should be added here */
+ static const struct drm_info_list pf_only_debugfs_list[] = {
++	{ "mtl_sriov_render_state", .show = xe_gt_debugfs_show_with_rpm,
++	  .data = mtl_sriov_render_state },
++	{ "mtl_sriov_cache_state", .show = xe_gt_debugfs_show_with_rpm,
++	  .data = mtl_sriov_cache_state },
+ 	{ "hw_engines", .show = xe_gt_debugfs_show_with_rpm, .data = hw_engines },
+ 	{ "mocs", .show = xe_gt_debugfs_show_with_rpm, .data = xe_mocs_dump },
+ 	{ "pat", .show = xe_gt_debugfs_show_with_rpm, .data = xe_pat_dump },
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
-index 786805684..ab9b0a745 100644
+index 7868056841b3c8842462f8cd8fda35a914942751..ab9b0a745fdfbaad2d881af29836404a94a8817e 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf.c
 @@ -98,6 +98,8 @@ static void pf_fini_action(void *arg)
@@ -202,7 +576,7 @@ index 786805684..ab9b0a745 100644
  
  static int pf_init_late(struct xe_gt *gt)
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
-index 2c9b85b84..e61af4ea1 100644
+index 2c9b85b84b1be797eb1696f8807763cb1c80dff7..8b7ce49296310e5f5f8f86390c9f8b994d2247d9 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c
 @@ -18,6 +18,7 @@
@@ -222,7 +596,18 @@ index 2c9b85b84..e61af4ea1 100644
  
  	if (config->ggtt_region) {
  		err = pf_distribute_config_ggtt(tile, vfid, 0, 0);
-@@ -2878,7 +2881,12 @@ int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool forc
+@@ -535,7 +538,9 @@ static int pf_provision_vf_ggtt(struct xe_gt *gt, unsigned int vfid, u64 size)
+ 	if (IS_ERR(node))
+ 		return PTR_ERR(node);
+ 
+-	xe_ggtt_assign(node, vfid);
++	err = xe_ggtt_assign(node, vfid);
++	if (err)
++		goto err;
+ 	xe_gt_sriov_dbg_verbose(gt, "VF%u assigned GGTT %llx-%llx\n",
+ 				vfid, xe_ggtt_node_addr(node), xe_ggtt_node_addr(node) + size - 1);
+ 
+@@ -2878,7 +2883,12 @@ int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool forc
  
  	xe_gt_assert(gt, vfid);
  
@@ -235,7 +620,31 @@ index 2c9b85b84..e61af4ea1 100644
  	err = pf_send_vf_cfg_reset(gt, vfid);
  	if (!err || force)
  		pf_release_vf_config(gt, vfid);
-@@ -2964,6 +2972,7 @@ int xe_gt_sriov_pf_config_sanitize(struct xe_gt *gt, unsigned int vfid, long tim
+@@ -2893,10 +2903,9 @@ int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool forc
+ 	return force ? 0 : err;
+ }
+ 
+-static void pf_sanitize_ggtt(struct xe_ggtt_node *ggtt_region, unsigned int vfid)
++static int pf_sanitize_ggtt(struct xe_ggtt_node *ggtt_region, unsigned int vfid)
+ {
+-	if (ggtt_region)
+-		xe_ggtt_assign(ggtt_region, vfid);
++	return ggtt_region ? xe_ggtt_assign(ggtt_region, vfid) : 0;
+ }
+ 
+ static int pf_sanitize_lmem(struct xe_tile *tile, struct xe_bo *bo, long timeout)
+@@ -2940,8 +2949,8 @@ static int pf_sanitize_vf_resources(struct xe_gt *gt, u32 vfid, long timeout)
+ 	 * GuC doorbell IDs and context IDs do not need any clearing.
+ 	 */
+ 	if (xe_gt_is_main_type(gt)) {
+-		pf_sanitize_ggtt(config->ggtt_region, vfid);
+-		if (IS_DGFX(xe))
++		err = pf_sanitize_ggtt(config->ggtt_region, vfid);
++		if (!err && IS_DGFX(xe))
+ 			err = pf_sanitize_lmem(tile, config->lmem_obj, timeout);
+ 	}
+ 
+@@ -2964,6 +2973,7 @@ int xe_gt_sriov_pf_config_sanitize(struct xe_gt *gt, unsigned int vfid, long tim
  
  	xe_gt_assert(gt, vfid != PFID);
  
@@ -244,7 +653,7 @@ index 2c9b85b84..e61af4ea1 100644
  	err = pf_sanitize_vf_resources(gt, vfid, timeout);
  	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c
-index 058585f06..104274443 100644
+index 058585f063a93574828d028d46c578322a189d5c..582dbfc9ebc2feca75354c7ae37b4eebe3ae00da 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c
 @@ -13,6 +13,7 @@
@@ -255,7 +664,35 @@ index 058585f06..104274443 100644
  #include "xe_gt_sriov_pf_migration.h"
  #include "xe_gt_sriov_pf_monitor.h"
  #include "xe_gt_sriov_printk.h"
-@@ -1557,11 +1558,17 @@ static bool pf_enter_vf_flr_wip(struct xe_gt *gt, unsigned int vfid)
+@@ -24,6 +25,7 @@
+ #include "xe_sriov_pf_migration.h"
+ #include "xe_sriov_pf_service.h"
+ #include "xe_tile.h"
++#include "xe_trace.h"
+ 
+ static const char *control_cmd_to_string(u32 cmd)
+ {
+@@ -302,6 +304,9 @@ static bool pf_enter_vf_state(struct xe_gt *gt, unsigned int vfid,
+ 			      enum xe_gt_sriov_control_bits bit)
+ {
+ 	if (!test_and_set_bit(bit, pf_peek_vf_state(gt, vfid))) {
++		if (trace_xe_sriov_pf_vf_state_enabled())
++			trace_xe_sriov_pf_vf_state(gt, vfid, bit, true,
++						 READ_ONCE(*pf_peek_vf_state(gt, vfid)));
+ 		pf_track_vf_state(gt, vfid, bit, "enter");
+ 		return true;
+ 	}
+@@ -312,6 +317,9 @@ static bool pf_exit_vf_state(struct xe_gt *gt, unsigned int vfid,
+ 			     enum xe_gt_sriov_control_bits bit)
+ {
+ 	if (test_and_clear_bit(bit, pf_peek_vf_state(gt, vfid))) {
++		if (trace_xe_sriov_pf_vf_state_enabled())
++			trace_xe_sriov_pf_vf_state(gt, vfid, bit, false,
++						 READ_ONCE(*pf_peek_vf_state(gt, vfid)));
+ 		pf_track_vf_state(gt, vfid, bit, "exit");
+ 		return true;
+ 	}
+@@ -1557,11 +1565,17 @@ static bool pf_enter_vf_flr_wip(struct xe_gt *gt, unsigned int vfid)
  {
  	if (!pf_enter_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP))
  		return false;
@@ -274,7 +711,7 @@ index 058585f06..104274443 100644
  {
  	if (pf_exit_vf_state(gt, vfid, XE_GT_SRIOV_STATE_FLR_WIP)) {
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h
-index 23182a5c5..6357ff759 100644
+index 23182a5c5fb843850061ec896cee2fb3ee94042c..6357ff759ec900c8feed4455d3a1cdbcf5609f58 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h
 @@ -12,6 +12,7 @@
@@ -285,11 +722,41 @@ index 23182a5c5..6357ff759 100644
  void xe_gt_sriov_pf_control_restart(struct xe_gt *gt);
  
  int xe_gt_sriov_pf_control_pause_vf(struct xe_gt *gt, unsigned int vfid);
+diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_monitor.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_monitor.c
+index a85ba4435378987770bef090ca31bcdd05427b9c..9cda69b92915ad11af847e4c7a1379444877cdc2 100644
+--- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_monitor.c
++++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_monitor.c
+@@ -12,6 +12,7 @@
+ #include "xe_gt_sriov_printk.h"
+ #include "xe_guc_klv_helpers.h"
+ #include "xe_guc_klv_thresholds_set.h"
++#include "xe_trace.h"
+ 
+ /**
+  * xe_gt_sriov_pf_monitor_flr - Cleanup VF data after VF FLR.
+@@ -51,6 +52,7 @@ static int pf_handle_vf_threshold_event(struct xe_gt *gt, u32 vfid, u32 threshol
+ 
+ 	/* was there a new KEY added that we missed? */
+ 	if (unlikely(e < 0)) {
++		trace_xe_sriov_pf_adverse(gt, vfid, threshold, 0, -ENOTCONN);
+ 		xe_gt_sriov_notice(gt, "unknown threshold key %#x reported for %s\n",
+ 				   threshold, origin);
+ 		return -ENOTCONN;
+@@ -61,6 +63,9 @@ static int pf_handle_vf_threshold_event(struct xe_gt *gt, u32 vfid, u32 threshol
+ 			xe_guc_klv_key_to_string(threshold));
+ 
+ 	pf_update_event_counter(gt, vfid, e);
++	if (trace_xe_sriov_pf_adverse_enabled())
++		trace_xe_sriov_pf_adverse(gt, vfid, threshold,
++					 xe_gt_sriov_pf_config_get_threshold(gt, vfid, e), 0);
+ 
+ 	return 0;
+ }
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c
-index 6586df2fc..922330e99 100644
+index 6586df2fcb9152c34d4cea3925fa3c4eff5ad14a..990ad244e9aeffb20da433130df9b85117cf204a 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c
-@@ -4,14 +4,22 @@
+@@ -4,14 +4,23 @@
   */
  
  #include <drm/drm_managed.h>
@@ -300,6 +767,7 @@ index 6586df2fc..922330e99 100644
 +#include "abi/guc_mmio_relay_abi.h"
 +#include "abi/guc_ggtt_relay_abi.h"
  
++#include "regs/xe_gsc_regs.h"
  #include "regs/xe_gt_regs.h"
  #include "regs/xe_guc_regs.h"
  
@@ -312,11 +780,59 @@ index 6586df2fc..922330e99 100644
  #include "xe_gt_sriov_printk.h"
  #include "xe_gt_sriov_pf_service.h"
  #include "xe_gt_sriov_pf_service_types.h"
-@@ -20,6 +28,325 @@
+@@ -19,6 +28,419 @@
+ #include "xe_guc_hxg_helpers.h"
  #include "xe_sriov.h"
  #include "xe_sriov_pf_service.h"
- 
++#include "xe_trace.h"
++
 +static void pf_mmio_worker(struct work_struct *work);
++
++static void pf_trace_request(struct xe_gt_sriov_pf_mmio *mmio)
++{
++	struct xe_sriov_vf_trace *trace = &mmio->trace;
++	u32 descriptor;
++
++	*trace = (struct xe_sriov_vf_trace) {
++		.id = ++mmio->trace_serial,
++		.gt_id = mmio->gt->info.id,
++		.vfid = mmio->vfid,
++		.ctb = mmio->ctb,
++		.generation = mmio->request_generation,
++		.epoch = mmio->request_epoch,
++		.primary_epoch = mmio->primary_epoch,
++	};
++	if (mmio->ctb) {
++		trace->opcode = GUC_RELAY_ACTION_VF2PF_UPDATE_GGTT32;
++		descriptor = mmio->ctb_msg[1];
++		trace->offset = FIELD_GET(VF2PF_GGTT_OFFSET, descriptor);
++		trace->mode = FIELD_GET(VF2PF_GGTT_MODE, descriptor);
++		trace->copies = FIELD_GET(VF2PF_GGTT_COPIES, descriptor);
++		trace->count = (mmio->ctb_len - 2) / 2;
++	} else {
++		trace->opcode = FIELD_GET(GUC_MMIO_RELAY_OPCODE, mmio->msg[2]);
++		trace->token = FIELD_GET(GUC_MMIO_RELAY_MAGIC, mmio->msg[2]);
++		if (trace->opcode == IOV_MMIO_UPDATE_GGTT) {
++			descriptor = mmio->msg[3];
++			trace->offset = FIELD_GET(IOV_MMIO_GGTT_OFFSET, descriptor);
++			trace->mode = FIELD_GET(IOV_MMIO_GGTT_MODE, descriptor);
++			trace->copies = FIELD_GET(IOV_MMIO_GGTT_COPIES, descriptor);
++			trace->count = 1;
++		}
++	}
++	trace_xe_sriov_vf_request(mmio->gt, trace, XE_SRIOV_TRACE_QUEUE, 0, 0, 0);
++}
++
++static void pf_trace_reject(struct xe_gt *gt, u32 vfid, bool ctb, u32 opcode, int err)
++{
++	struct xe_sriov_vf_trace trace = {
++		.vfid = vfid,
++		.ctb = ctb,
++		.opcode = opcode,
++	};
++
++	trace_xe_sriov_vf_request(gt, &trace, XE_SRIOV_TRACE_REJECT, err, 0, 0);
++}
 +
 +static bool pf_mmio_current(struct xe_gt_sriov_pf_mmio *mmio)
 +{
@@ -423,21 +939,31 @@ index 6586df2fc..922330e99 100644
 +		mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
 +		return -ECANCELED;
 +	}
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_GGTT_SUBMIT, 0, 0, 0);
 +	fence = xe_ggtt_update_vf_ptes(node, mmio->vfid, offset, mode, copies, ptes, count);
 +	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
-+	if (IS_ERR(fence))
++	if (IS_ERR(fence)) {
++		trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_GGTT_DONE,
++					  PTR_ERR(fence), 0, 0);
 +		return PTR_ERR(fence);
++	}
 +
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_GGTT_FENCE,
++				  0, fence->context, fence->seqno);
 +	/* Keep the VF region pinned until HW completes, also on a scheduler reset. */
 +	err = dma_fence_wait(fence, false);
 +	if (!err)
 +		err = dma_fence_get_status(fence);
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_GGTT_DONE,
++				  err, fence->context, fence->seqno);
 +	dma_fence_put(fence);
 +	if (err < 0)
 +		return err;
 +	if (!pf_mmio_current(mmio))
 +		return -ECANCELED;
-+	err = xe_ggtt_invalidate_vf(gt->tile->mem.ggtt);
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_TLB_BEGIN, 0, 0, 0);
++	err = xe_ggtt_invalidate_vf(gt->tile->mem.ggtt, &mmio->trace);
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_TLB_DONE, err, 0, 0);
 +	if (err)
 +		return err;
 +	return copies + count;
@@ -491,6 +1017,7 @@ index 6586df2fc..922330e99 100644
 +	bool ctb = mmio->ctb;
 +
 +	xe_pm_runtime_get(xe);
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_WORK_BEGIN, 0, 0, 0);
 +	if (ctb) {
 +		if (pf_mmio_current(mmio))
 +			err = pf_ctb_update_ggtt(mmio);
@@ -548,9 +1075,26 @@ index 6586df2fc..922330e99 100644
 +			break;
 +		msleep(20);
 +	}
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_RESPONSE_SEND,
++				  ret, 0, 0);
++	if ((opcode == IOV_MMIO_HANDSHAKE || opcode == IOV_MMIO_GET_RUNTIME) &&
++	    trace_xe_sriov_pf_service_reply_enabled()) {
++		struct xe_sriov_pf_reply_trace meta = {
++			.id = mmio->trace.id,
++			.vfid = mmio->vfid,
++			.token = magic,
++			.action = opcode,
++			.result = err,
++			.send_result = ret,
++		};
++
++		trace_xe_sriov_pf_service_reply(gt, &meta, mmio->msg,
++					      ARRAY_SIZE(mmio->msg), reply, len);
++	}
 +	xe_gt_sriov_info(gt, "MMIO relay VF%u opcode %#x magic %#x result %d data0 %u send %d\n",
 +			 mmio->vfid, opcode, magic, err, data[0], ret);
 +done:
++	trace_xe_sriov_vf_request(gt, &mmio->trace, XE_SRIOV_TRACE_WORK_DONE, err, 0, 0);
 +	xe_pm_runtime_put(xe);
 +	atomic_set(&mmio->pending, 0);
 +	if (ctb)
@@ -571,16 +1115,23 @@ index 6586df2fc..922330e99 100644
 +	vfid = msg[1];
 +	if (!vfid || vfid > xe_gt_sriov_pf_get_totalvfs(gt))
 +		return -EINVAL;
-+	if (xe_gt_sriov_pf_control_flr_in_progress(gt, vfid))
++	if (xe_gt_sriov_pf_control_flr_in_progress(gt, vfid)) {
++		pf_trace_reject(gt, vfid, false,
++				FIELD_GET(GUC_MMIO_RELAY_OPCODE, msg[2]), -ECANCELED);
 +		return 0;
++	}
 +	mmio = &gt->sriov.pf.vfs[vfid].mmio;
-+	if (atomic_cmpxchg(&mmio->pending, 0, 1))
++	if (atomic_cmpxchg(&mmio->pending, 0, 1)) {
++		pf_trace_reject(gt, vfid, false,
++				FIELD_GET(GUC_MMIO_RELAY_OPCODE, msg[2]), -EBUSY);
 +		return 0;
++	}
 +	mmio->ctb = false;
 +	memcpy(mmio->msg, msg, sizeof(mmio->msg));
 +	mmio->request_generation = atomic_read(&mmio->generation);
 +	mmio->request_epoch = atomic_read(&gt->sriov.pf.service.mmio_epoch);
 +	mmio->primary_epoch = atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch);
++	pf_trace_request(mmio);
 +	xe_gt_sriov_info(gt, "MMIO relay VF%u queued len %u msg %*ph\n",
 +			 vfid, len, (int)sizeof(mmio->msg), msg);
 +	queue_work(gt->sriov.pf.service.mmio_wq, &mmio->work);
@@ -592,6 +1143,7 @@ index 6586df2fc..922330e99 100644
 +{
 +	struct xe_gt_sriov_pf_mmio *mmio;
 +	int generation, epoch, primary_epoch, ret;
++	struct xe_sriov_vf_trace trace;
 +
 +	if (!gt->sriov.pf.service.mmio_wq || MEDIA_VERx100(gt_to_xe(gt)) != 1300)
 +		return -EOPNOTSUPP;
@@ -606,8 +1158,11 @@ index 6586df2fc..922330e99 100644
 +	if (!size)
 +		return -ENOBUFS;
 +	mmio = &gt->sriov.pf.vfs[origin].mmio;
-+	if (atomic_cmpxchg(&mmio->pending, 0, 1))
++	if (atomic_cmpxchg(&mmio->pending, 0, 1)) {
++		pf_trace_reject(gt, origin, true, GUC_RELAY_ACTION_VF2PF_UPDATE_GGTT32,
++				-EINPROGRESS);
 +		return -EINPROGRESS;
++	}
 +	/* Use the same work item so FLR/release waits for both transports. */
 +	mmio->ctb = true;
 +	mmio->ctb_len = len;
@@ -616,29 +1171,89 @@ index 6586df2fc..922330e99 100644
 +	mmio->request_epoch = epoch = atomic_read(&gt->sriov.pf.service.mmio_epoch);
 +	mmio->primary_epoch = primary_epoch =
 +		atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch);
++	pf_trace_request(mmio);
++	trace = mmio->trace;
 +	reinit_completion(&mmio->ctb_done);
 +	queue_work(gt->sriov.pf.service.mmio_wq, &mmio->work);
 +	/* Called by the relay worker, outside the CT and PF configuration locks. */
 +	wait_for_completion(&mmio->ctb_done);
 +	ret = mmio->ctb_result;
-+	if (ret < 0)
++	if (ret < 0) {
++		trace_xe_sriov_vf_request(gt, &trace, XE_SRIOV_TRACE_RESPONSE_READY, ret, 0, 0);
 +		return ret;
++	}
 +	if (generation != atomic_read(&mmio->generation) ||
 +	    epoch != atomic_read(&gt->sriov.pf.service.mmio_epoch) ||
 +	    primary_epoch != atomic_read(&gt->tile->primary_gt->sriov.pf.service.mmio_epoch) ||
 +	    xe_gt_sriov_pf_control_flr_in_progress(gt, origin) ||
-+	    xe_gt_sriov_pf_control_flr_in_progress(gt->tile->primary_gt, origin))
++	    xe_gt_sriov_pf_control_flr_in_progress(gt->tile->primary_gt, origin)) {
++		trace_xe_sriov_vf_request(gt, &trace, XE_SRIOV_TRACE_RESPONSE_READY,
++					  -ECANCELED, 0, 0);
 +		return -ECANCELED;
++	}
 +	response[0] = FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_HOST) |
 +		      FIELD_PREP(GUC_HXG_MSG_0_TYPE, GUC_HXG_TYPE_RESPONSE_SUCCESS) |
 +		      FIELD_PREP(GUC_HXG_RESPONSE_MSG_0_DATA0, ret);
++	trace_xe_sriov_vf_request(gt, &trace, XE_SRIOV_TRACE_RESPONSE_READY, ret, 0, 0);
 +	return 1;
 +}
-+
+ 
  static const struct xe_reg tgl_runtime_regs[] = {
  	RPM_CONFIG0,			/* _MMIO(0x0d00) */
- 	MIRROR_FUSE3,			/* _MMIO(0x9118) */
-@@ -219,11 +546,34 @@ static void pf_prepare_runtime_info(struct xe_gt *gt)
+@@ -65,6 +487,25 @@ static const struct xe_reg ver_1270_runtime_regs[] = {
+ 	HUC_KERNEL_LOAD_INFO,		/* _MMIO(0xc1dc) */
+ };
+ 
++/* Match the i915 MTL runtime coverage on the primary GT only. */
++static const struct xe_reg mtl_runtime_regs[] = {
++	RPM_CONFIG0,			/* _MMIO(0x0d00) */
++	XEHP_FUSE4,			/* _MMIO(0x9114) */
++	MIRROR_FUSE3,			/* _MMIO(0x9118) */
++	MIRROR_FUSE1,			/* _MMIO(0x911c) */
++	XELP_EU_ENABLE,			/* _MMIO(0x9134) */
++	XELP_GT_GEOMETRY_DSS_ENABLE,	/* _MMIO(0x913c) */
++	GT_VEBOX_VDBOX_DISABLE,		/* _MMIO(0x9140) */
++	XEHP_GT_COMPUTE_DSS_ENABLE,	/* _MMIO(0x9144) */
++	XEHPC_GT_COMPUTE_DSS_ENABLE_EXT, /* _MMIO(0x9148) */
++	XE_REG(0xa26c),			/* CTC_MODE */
++	HUC_KERNEL_LOAD_INFO,		/* _MMIO(0xc1dc) */
++	XE_REG(0x44074),			/* Timestamp override */
++	XE_REG(0x10100c),		/* Early runtime */
++	HECI_FWSTS5(MTL_GSC_HECI1_BASE),	/* _MMIO(0x116c68) */
++	XE_REG(0x138010),		/* MTL_GT_ACTIVITY_FACTOR */
++};
++
+ static const struct xe_reg ver_2000_runtime_regs[] = {
+ 	RPM_CONFIG0,			/* _MMIO(0x0d00) */
+ 	XEHP_FUSE4,			/* _MMIO(0x9114) */
+@@ -116,11 +557,15 @@ static const struct xe_reg ver_35_runtime_regs[] = {
+ 	SERVICE_COPY_ENABLE,		/* _MMIO(0x9170) */
+ };
+ 
+-static const struct xe_reg *pick_runtime_regs(struct xe_device *xe, unsigned int *count)
++static const struct xe_reg *pick_runtime_regs(struct xe_gt *gt, unsigned int *count)
+ {
++	struct xe_device *xe = gt_to_xe(gt);
+ 	const struct xe_reg *regs;
+ 
+-	if (GRAPHICS_VER(xe) >= 35) {
++	if (xe->info.platform == XE_METEORLAKE && gt->info.type == XE_GT_TYPE_MAIN) {
++		*count = ARRAY_SIZE(mtl_runtime_regs);
++		regs = mtl_runtime_regs;
++	} else if (GRAPHICS_VER(xe) >= 35) {
+ 		*count = ARRAY_SIZE(ver_35_runtime_regs);
+ 		regs = ver_35_runtime_regs;
+ 	} else if (GRAPHICS_VERx100(xe) >= 3000) {
+@@ -161,7 +606,7 @@ static int pf_alloc_runtime_info(struct xe_gt *gt)
+ 	xe_gt_assert(gt, !gt->sriov.pf.service.runtime.regs);
+ 	xe_gt_assert(gt, !gt->sriov.pf.service.runtime.values);
+ 
+-	regs = pick_runtime_regs(xe, &size);
++	regs = pick_runtime_regs(gt, &size);
+ 	if (IS_ERR(regs))
+ 		return PTR_ERR(regs);
+ 
+@@ -219,11 +664,35 @@ static void pf_prepare_runtime_info(struct xe_gt *gt)
   */
  int xe_gt_sriov_pf_service_init(struct xe_gt *gt)
  {
@@ -664,6 +1279,7 @@ index 6586df2fc..922330e99 100644
 +
 +			mmio->gt = gt;
 +			mmio->vfid = vfid;
++			mmio->trace_serial = 0;
 +			atomic_set(&mmio->pending, 0);
 +			atomic_set(&mmio->generation, 0);
 +			INIT_WORK(&mmio->work, pf_mmio_worker);
@@ -673,7 +1289,7 @@ index 6586df2fc..922330e99 100644
  
  	return 0;
  failed:
-@@ -390,6 +740,9 @@ int xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
+@@ -390,6 +859,9 @@ int xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
  	case GUC_RELAY_ACTION_VF2PF_QUERY_RUNTIME:
  		ret = pf_process_runtime_query_msg(gt, origin, msg, msg_len, response, resp_size);
  		break;
@@ -684,7 +1300,7 @@ index 6586df2fc..922330e99 100644
  		ret = -EOPNOTSUPP;
  		break;
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h
-index 10b02c9b6..c1905b008 100644
+index 10b02c9b651c11d77496a116eb908e04cb3a05ef..c1905b008cadc4520623689bfe3b843b1c483362 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h
 @@ -18,10 +18,23 @@ void xe_gt_sriov_pf_service_update(struct xe_gt *gt);
@@ -712,10 +1328,10 @@ index 10b02c9b6..c1905b008 100644
  xe_gt_sriov_pf_service_process_request(struct xe_gt *gt, u32 origin,
  				       const u32 *msg, u32 msg_len,
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h
-index ad6dd75f0..3e475560a 100644
+index ad6dd75f00568bd9b1571b834091de9c0778f641..b2dfada2f83f69b7c73cecbba7b0953f22662e96 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h
-@@ -7,8 +7,32 @@
+@@ -7,8 +7,35 @@
  #define _XE_GT_SRIOV_PF_SERVICE_TYPES_H_
  
  #include <linux/types.h>
@@ -724,6 +1340,7 @@ index ad6dd75f0..3e475560a 100644
 +#include <linux/completion.h>
 +
 +#include "abi/guc_relay_communication_abi.h"
++#include "xe_sriov_trace_types.h"
  
  struct xe_reg;
 +struct xe_gt;
@@ -744,11 +1361,13 @@ index ad6dd75f0..3e475560a 100644
 +	int request_generation;
 +	int request_epoch;
 +	int primary_epoch;
++	u64 trace_serial;
++	struct xe_sriov_vf_trace trace;
 +};
  
  /**
   * struct xe_gt_sriov_pf_service_version - VF/PF ABI Version.
-@@ -47,6 +71,8 @@ struct xe_gt_sriov_pf_service {
+@@ -47,6 +74,8 @@ struct xe_gt_sriov_pf_service {
  		struct xe_gt_sriov_pf_service_version latest;
  	} version;
  	struct xe_gt_sriov_pf_service_runtime_regs runtime;
@@ -758,7 +1377,7 @@ index ad6dd75f0..3e475560a 100644
  
  #endif
 diff --git a/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h b/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h
-index 6296483c4..ae3a5e839 100644
+index 6296483c44ec3825510d4f52bb1309325e935902..ae3a5e8395f17c3e4d3c58f4c2e43c6147c4942e 100644
 --- a/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h
 +++ b/drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h
 @@ -33,6 +33,8 @@ struct xe_gt_sriov_metadata {
@@ -770,8 +1389,90 @@ index 6296483c4..ae3a5e839 100644
  };
  
  /**
+diff --git a/drivers/gpu/drm/xe/xe_guc.c b/drivers/gpu/drm/xe/xe_guc.c
+index 4023700ff2a9678f6168d776b49c892adc8a58e5..a89c9dd135a51412036996c1d2cb6da710107ddc 100644
+--- a/drivers/gpu/drm/xe/xe_guc.c
++++ b/drivers/gpu/drm/xe/xe_guc.c
+@@ -40,9 +40,11 @@
+ #include "xe_guc_submit.h"
+ #include "xe_memirq.h"
+ #include "xe_mmio.h"
++#include "xe_module.h"
+ #include "xe_platform_types.h"
+ #include "xe_sleep.h"
+ #include "xe_sriov.h"
++#include "xe_trace.h"
+ #include "xe_sriov_pf_migration.h"
+ #include "xe_uc.h"
+ #include "xe_uc_fw.h"
+@@ -89,6 +91,20 @@ static u32 guc_ctl_feature_flags(struct xe_guc *guc)
+ 	struct xe_device *xe = guc_to_xe(guc);
+ 	u32 flags = GUC_CTL_ENABLE_LITE_RESTORE;
+ 
++	/*
++	 * Keep the normal Xe default unless explicitly testing the experimental
++	 * MTL/ARL PF with foreign VF drivers. Those drivers do not use Xe's
++	 * per-job L3 read-only cache invalidation in xe_ring_ops.c.
++	 * Clearing only this GuC feature tests that assumption without changing
++	 * the relay, cache programming or context-switch workaround protocols.
++	 */
++	if (xe_modparam.mtl_sriov_full_restore && IS_SRIOV_PF(xe) &&
++	    xe->info.platform == XE_METEORLAKE) {
++		flags &= ~GUC_CTL_ENABLE_LITE_RESTORE;
++		xe_gt_info(guc_to_gt(guc),
++			   "experimental MTL/ARL SR-IOV: GuC lite restore disabled\n");
++	}
++
+ 	if (!xe->info.skip_guc_pc)
+ 		flags |= GUC_CTL_ENABLE_SLPC;
+ 
+@@ -268,6 +284,12 @@ static void guc_init_params_post_hwconfig(struct xe_guc *guc)
+ 	params[GUC_CTL_DEBUG] = guc_ctl_debug_flags(guc);
+ 	params[GUC_CTL_ADS] = guc_ctl_ads_flags(guc);
+ 	params[GUC_CTL_WA] = guc_ctl_wa_flags(guc);
++	if (IS_SRIOV_PF(guc_to_xe(guc))) {
++		trace_xe_sriov_guc_params(guc_to_gt(guc), params[GUC_CTL_WA],
++					  params[GUC_CTL_FEATURE], params[GUC_CTL_ADS]);
++		xe_gt_info(guc_to_gt(guc), "VF trace GuC wa=%#x feature=%#x ads=%#x\n",
++			   params[GUC_CTL_WA], params[GUC_CTL_FEATURE], params[GUC_CTL_ADS]);
++	}
+ 	params[GUC_CTL_DEVID] = guc_ctl_devid(guc);
+ 
+ 	guc_print_params(guc);
+diff --git a/drivers/gpu/drm/xe/xe_guc_ads.c b/drivers/gpu/drm/xe/xe_guc_ads.c
+index 886bafd31f45a50e4212760ba1c58695232fde2f..3bb75c7b7ed1590e33284026cca80e503dccc82c 100644
+--- a/drivers/gpu/drm/xe/xe_guc_ads.c
++++ b/drivers/gpu/drm/xe/xe_guc_ads.c
+@@ -28,6 +28,8 @@
+ #include "xe_lrc.h"
+ #include "xe_map.h"
+ #include "xe_mmio.h"
++#include "xe_sriov.h"
++#include "xe_trace.h"
+ #include "xe_wa.h"
+ 
+ /* Slack of a few additional entries per engine */
+@@ -270,6 +272,9 @@ static void guc_waklv_enable(struct xe_guc_ads *ads,
+ 	size_t size = sizeof(u32) * (1 + data_len_dw);
+ 
+ 	if (*remain < size) {
++		if (IS_SRIOV_PF(ads_to_xe(ads)))
++			trace_xe_sriov_pf_wa_klv(ads_to_gt(ads), klv_id, data,
++						data_len_dw, -ENOSPC);
+ 		drm_warn(&ads_to_xe(ads)->drm,
+ 			 "w/a klv buffer too small to add klv id 0x%04X\n", klv_id);
+ 		return;
+@@ -281,6 +286,8 @@ static void guc_waklv_enable(struct xe_guc_ads *ads,
+ 	/* data_len_dw dwords of data */
+ 	xe_map_memcpy_to(ads_to_xe(ads), ads_to_map(ads),
+ 			 *offset + sizeof(u32), data, data_len_dw * sizeof(u32));
++	if (IS_SRIOV_PF(ads_to_xe(ads)))
++		trace_xe_sriov_pf_wa_klv(ads_to_gt(ads), klv_id, data, data_len_dw, 0);
+ 
+ 	*offset += size;
+ 	*remain -= size;
 diff --git a/drivers/gpu/drm/xe/xe_guc_ct.c b/drivers/gpu/drm/xe/xe_guc_ct.c
-index 21e0dad9a..154f39e53 100644
+index 21e0dad9a4815428d87cebbcb1a8b596a77f0251..94b68dfaf6e7b0b4bc28d16b931f6efde3aa9a5b 100644
 --- a/drivers/gpu/drm/xe/xe_guc_ct.c
 +++ b/drivers/gpu/drm/xe/xe_guc_ct.c
 @@ -16,6 +16,7 @@
@@ -790,7 +1491,16 @@ index 21e0dad9a..154f39e53 100644
  #include "xe_guc.h"
  #include "xe_guc_log.h"
  #include "xe_guc_pagefault.h"
-@@ -726,6 +728,7 @@ static void stop_g2h_handler(struct xe_guc_ct *ct)
+@@ -36,6 +38,8 @@
+ #include "xe_sleep.h"
+ #include "xe_sriov_vf.h"
+ #include "xe_trace_guc.h"
++#include "xe_trace.h"
++#include "xe_sriov.h"
+ 
+ static void receive_g2h(struct xe_guc_ct *ct);
+ static void g2h_worker_func(struct work_struct *w);
+@@ -726,6 +730,7 @@ static void stop_g2h_handler(struct xe_guc_ct *ct)
  void xe_guc_ct_disable(struct xe_guc_ct *ct)
  {
  	guc_ct_change_state(ct, XE_GUC_CT_STATE_DISABLED);
@@ -798,7 +1508,7 @@ index 21e0dad9a..154f39e53 100644
  	ct_exit_safe_mode(ct);
  	stop_g2h_handler(ct);
  }
-@@ -752,6 +755,7 @@ void xe_guc_ct_stop(struct xe_guc_ct *ct)
+@@ -752,6 +757,7 @@ void xe_guc_ct_stop(struct xe_guc_ct *ct)
  		return;
  
  	guc_ct_change_state(ct, XE_GUC_CT_STATE_STOPPED);
@@ -806,7 +1516,7 @@ index 21e0dad9a..154f39e53 100644
  	stop_g2h_handler(ct);
  }
  
-@@ -1273,6 +1277,13 @@ int xe_guc_ct_send_g2h_handler(struct xe_guc_ct *ct, const u32 *action, u32 len)
+@@ -1273,6 +1279,13 @@ int xe_guc_ct_send_g2h_handler(struct xe_guc_ct *ct, const u32 *action, u32 len)
  	return ret;
  }
  
@@ -820,7 +1530,51 @@ index 21e0dad9a..154f39e53 100644
  /*
   * Check if a GT reset is in progress or will occur and if GT reset brought the
   * CT back up. Randomly picking 5 seconds for an upper limit to do a GT a reset.
-@@ -1682,6 +1693,14 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+@@ -1617,6 +1630,24 @@ static int parse_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+ 	return ret;
+ }
+ 
++static bool pf_diag_guc_action(u32 action)
++{
++	switch (action) {
++	case XE_GUC_ACTION_CONTEXT_RESET_NOTIFICATION:
++	case XE_GUC_ACTION_ENGINE_FAILURE_NOTIFICATION:
++	case XE_GUC_ACTION_STATE_CAPTURE_NOTIFICATION:
++	case XE_GUC_ACTION_NOTIFY_MEMORY_CAT_ERROR:
++	case GUC_ACTION_GUC2PF_VF_STATE_NOTIFY:
++	case GUC_ACTION_GUC2PF_ADVERSE_EVENT:
++	case XE_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED:
++	case XE_GUC_ACTION_NOTIFY_EXCEPTION:
++	case XE_GUC_ACTION_NOTIFY_MULTI_QUEUE_CGP_CONTEXT_ERROR:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+ {
+ 	struct xe_guc *guc = ct_to_guc(ct);
+@@ -1626,6 +1657,7 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+ 	u32 action, adj_len;
+ 	u32 *payload;
+ 	int ret = 0;
++	bool diag;
+ 
+ 	if (FIELD_GET(GUC_HXG_MSG_0_TYPE, hxg[0]) != GUC_HXG_TYPE_EVENT)
+ 		return 0;
+@@ -1633,6 +1665,10 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+ 	action = FIELD_GET(GUC_HXG_EVENT_MSG_0_ACTION, hxg[0]);
+ 	payload = hxg + GUC_HXG_EVENT_MSG_MIN_LEN;
+ 	adj_len = hxg_len - GUC_HXG_EVENT_MSG_MIN_LEN;
++	diag = trace_xe_sriov_pf_guc_event_enabled() && IS_SRIOV_PF(gt_to_xe(gt)) &&
++		pf_diag_guc_action(action);
++	if (diag)
++		trace_xe_sriov_pf_guc_event(gt, action, false, 0, hxg, hxg_len);
+ 
+ 	switch (action) {
+ 	case XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE:
+@@ -1682,6 +1718,14 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
  	case GUC_ACTION_GUC2PF_ADVERSE_EVENT:
  		ret = xe_gt_sriov_pf_monitor_process_guc2pf(gt, hxg, hxg_len);
  		break;
@@ -835,8 +1589,18 @@ index 21e0dad9a..154f39e53 100644
  	case XE_GUC_ACTION_NOTIFY_CRASH_DUMP_POSTED:
  	case XE_GUC_ACTION_NOTIFY_EXCEPTION:
  		ret = guc_crash_process_msg(ct, action);
+@@ -1702,6 +1746,9 @@ static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
+ 		xe_gt_err(gt, "unexpected G2H action 0x%04x\n", action);
+ 	}
+ 
++	if (diag)
++		trace_xe_sriov_pf_guc_event(gt, action, true, ret, hxg, hxg_len);
++
+ 	if (ret) {
+ 		xe_gt_err(gt, "G2H action %#04x failed (%pe) len %u msg %*ph\n",
+ 			  action, ERR_PTR(ret), hxg_len, (int)sizeof(u32) * hxg_len, hxg);
 diff --git a/drivers/gpu/drm/xe/xe_guc_ct.h b/drivers/gpu/drm/xe/xe_guc_ct.h
-index 767365a33..a197a0c3c 100644
+index 767365a33deeac7c99437686b8c69318a5d19ada..a197a0c3ce87668adfdc5f026bb043829c2c2bf5 100644
 --- a/drivers/gpu/drm/xe/xe_guc_ct.h
 +++ b/drivers/gpu/drm/xe/xe_guc_ct.h
 @@ -66,6 +66,7 @@ xe_guc_ct_send_block(struct xe_guc_ct *ct, const u32 *action, u32 len)
@@ -847,8 +1611,114 @@ index 767365a33..a197a0c3c 100644
  
  /* Can't fail because a GT reset is in progress */
  int xe_guc_ct_send_recv_no_fail(struct xe_guc_ct *ct, const u32 *action,
+diff --git a/drivers/gpu/drm/xe/xe_guc_relay.c b/drivers/gpu/drm/xe/xe_guc_relay.c
+index eed0a750d2eb2af2a69999b055d9a426e7e53723..1e4aa640ecd32907f989ae8803f44926f5ee32d8 100644
+--- a/drivers/gpu/drm/xe/xe_guc_relay.c
++++ b/drivers/gpu/drm/xe/xe_guc_relay.c
+@@ -26,6 +26,7 @@
+ #include "xe_guc_relay.h"
+ #include "xe_guc_relay_types.h"
+ #include "xe_sriov.h"
++#include "xe_trace.h"
+ 
+ /*
+  * How long should we wait for the response?
+@@ -305,6 +306,10 @@ static int relay_send_transaction(struct xe_guc_relay *relay, struct relay_trans
+ 		    txn->rid, txn->remote, (int)sizeof(u32) * len, msg);
+ 
+ 	ret = xe_guc_ct_send_block(relay_to_ct(relay), buf, len + txn->offset);
++	if (txn->incoming && IS_SRIOV_PF(relay_to_xe(relay)))
++		trace_xe_sriov_relay(relay_to_gt(relay), txn->remote, txn->rid,
++			FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]),
++			XE_SRIOV_TRACE_RESPONSE_SEND, ret);
+ 
+ 	if (unlikely(ret > 0)) {
+ 		relay_notice(relay, "Unexpected data=%d from GuC, wrong ABI?\n", ret);
+@@ -719,12 +724,36 @@ static struct relay_transaction *relay_dequeue_transaction(struct xe_guc_relay *
+ 	return txn;
+ }
+ 
++static void pf_trace_service_reply(struct xe_guc_relay *relay,
++				   struct relay_transaction *txn,
++				   int result, int send_result)
++{
++	struct xe_sriov_pf_reply_trace meta = {
++		.id = txn->rid,
++		.vfid = txn->remote,
++		.ctb = true,
++		.result = result,
++		.send_result = send_result,
++	};
++
++	if (!trace_xe_sriov_pf_service_reply_enabled() || !IS_SRIOV_PF(relay_to_xe(relay)))
++		return;
++	meta.action = FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]);
++	if (meta.action != GUC_RELAY_ACTION_VF2PF_HANDSHAKE &&
++	    meta.action != GUC_RELAY_ACTION_VF2PF_QUERY_RUNTIME)
++		return;
++
++	trace_xe_sriov_pf_service_reply(relay_to_gt(relay), &meta,
++				      txn->request_buf + txn->offset, txn->request_len,
++				      txn->response_buf + txn->offset, txn->response_len);
++}
++
+ static void relay_process_incoming_action(struct xe_guc_relay *relay)
+ {
+ 	struct relay_transaction *txn;
+ 	bool again = false;
+ 	u32 type;
+-	int ret;
++	int ret, service_result;
+ 
+ 	txn = relay_dequeue_transaction(relay);
+ 	if (!txn)
+@@ -732,11 +761,18 @@ static void relay_process_incoming_action(struct xe_guc_relay *relay)
+ 
+ 	type = FIELD_GET(GUC_HXG_MSG_0_TYPE, txn->request_buf[txn->offset]);
+ 
++	trace_xe_sriov_relay(relay_to_gt(relay), txn->remote, txn->rid,
++		FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]),
++		XE_SRIOV_TRACE_RELAY_HANDLE, 0);
+ 	ret = relay_action_handler(relay, txn->remote,
+ 				   txn->request_buf + txn->offset, txn->request_len,
+ 				   txn->response_buf + txn->offset,
+ 				   ARRAY_SIZE(txn->response_buf) - txn->offset);
+ 
++	trace_xe_sriov_relay(relay_to_gt(relay), txn->remote, txn->rid,
++		FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, txn->request_buf[txn->offset]),
++		XE_SRIOV_TRACE_RELAY_RESULT, ret);
++	service_result = ret > 0 ? 0 : ret;
+ 	if (ret == -EINPROGRESS) {
+ 		again = true;
+ 		ret = guc_hxg_msg_encode_busy(txn->response_buf + txn->offset, 0);
+@@ -745,6 +781,7 @@ static void relay_process_incoming_action(struct xe_guc_relay *relay)
+ 	if (ret > 0) {
+ 		txn->response_len = ret;
+ 		ret = relay_send_transaction(relay, txn);
++		pf_trace_service_reply(relay, txn, service_result, ret);
+ 	}
+ 
+ 	if (ret < 0) {
+@@ -760,6 +797,7 @@ static void relay_process_incoming_action(struct xe_guc_relay *relay)
+ 							txn->remote ?
+ 							sanitize_relay_error_hint(-ret) : -ret);
+ 		ret = relay_send_transaction(relay, txn);
++		pf_trace_service_reply(relay, txn, service_result, ret);
+ 		again = false;
+ 	}
+ 
+@@ -814,6 +852,9 @@ static int relay_queue_action_msg(struct xe_guc_relay *relay, u32 origin, u32 ri
+ 	txn = relay_new_incoming_transaction(relay, origin, rid, msg, len);
+ 	if (IS_ERR(txn))
+ 		return PTR_ERR(txn);
++	trace_xe_sriov_relay(relay_to_gt(relay), origin, rid,
++		FIELD_GET(GUC_HXG_REQUEST_MSG_0_ACTION, msg[0]),
++		XE_SRIOV_TRACE_RELAY_RECEIVE, 0);
+ 
+ 	spin_lock(&relay->lock);
+ 	list_add_tail(&txn->link, &relay->incoming_actions);
 diff --git a/drivers/gpu/drm/xe/xe_migrate.c b/drivers/gpu/drm/xe/xe_migrate.c
-index be787f331..d01c900b3 100644
+index be787f331768d56eb4bbd44d06a31e2c3b79161f..d01c900b364c1fd14e3d77ed0a27af0e448f8fdb 100644
 --- a/drivers/gpu/drm/xe/xe_migrate.c
 +++ b/drivers/gpu/drm/xe/xe_migrate.c
 @@ -4,6 +4,7 @@
@@ -919,7 +1789,7 @@ index be787f331..d01c900b3 100644
  			       struct xe_bb *bb,
  			       u64 src_ofs, bool src_is_indirect,
 diff --git a/drivers/gpu/drm/xe/xe_migrate.h b/drivers/gpu/drm/xe/xe_migrate.h
-index c3a268b01..29b54fd81 100644
+index c3a268b01768ae6c45329864c83bc4013ca749e0..29b54fd81cfd6023e16e21a8358b321616798036 100644
 --- a/drivers/gpu/drm/xe/xe_migrate.h
 +++ b/drivers/gpu/drm/xe/xe_migrate.h
 @@ -165,6 +165,9 @@ struct dma_fence *xe_migrate_clear(struct xe_migrate *m,
@@ -932,8 +1802,47 @@ index c3a268b01..29b54fd81 100644
  struct dma_fence *
  xe_migrate_update_pgtables(struct xe_migrate *m,
  			   struct xe_migrate_pt_update *pt_update);
+diff --git a/drivers/gpu/drm/xe/xe_module.c b/drivers/gpu/drm/xe/xe_module.c
+index 99347f216ec8932216695324f808d0f2ac41d9b9..d4b637bd7e702f871fc3301a86ece8ec74250d2e 100644
+--- a/drivers/gpu/drm/xe/xe_module.c
++++ b/drivers/gpu/drm/xe/xe_module.c
+@@ -40,6 +40,16 @@ MODULE_PARM_DESC(svm_notifier_size, "Set the svm notifier size in MiB, must be p
+ module_param_named_unsafe(force_execlist, xe_modparam.force_execlist, bool, 0444);
+ MODULE_PARM_DESC(force_execlist, "Force Execlist submission");
+ 
++module_param_named_unsafe(mtl_sriov_full_restore,
++			  xe_modparam.mtl_sriov_full_restore, bool, 0444);
++MODULE_PARM_DESC(mtl_sriov_full_restore,
++		 "Experimental MTL/ARL SR-IOV PF diagnostic: disable GuC lite restore (default=false)");
++
++module_param_named_unsafe(mtl_sriov_gpu_assign,
++			  xe_modparam.mtl_sriov_gpu_assign, bool, 0444);
++MODULE_PARM_DESC(mtl_sriov_gpu_assign,
++		 "Experimental MTL/ARL SR-IOV PF diagnostic: assign GGTT owner using MI_UPDATE_GTT (default=false)");
++
+ #if IS_ENABLED(CONFIG_DRM_XE_DISPLAY)
+ module_param_named(probe_display, xe_modparam.probe_display, bool, 0444);
+ MODULE_PARM_DESC(probe_display, "Probe display HW, otherwise it's left untouched "
+diff --git a/drivers/gpu/drm/xe/xe_module.h b/drivers/gpu/drm/xe/xe_module.h
+index e8e54f701cf3ee8bbd5df9e71b3e9b18cf21c012..818277aa0617041efb5948b1c5af41973683f4b4 100644
+--- a/drivers/gpu/drm/xe/xe_module.h
++++ b/drivers/gpu/drm/xe/xe_module.h
+@@ -14,6 +14,8 @@ struct work_struct;
+ struct xe_modparam {
+ 	bool force_execlist;
+ 	bool probe_display;
++	bool mtl_sriov_full_restore;
++	bool mtl_sriov_gpu_assign;
+ 	int force_vram_bar_size;
+ 	int guc_log_level;
+ 	char *guc_firmware_path;
+@@ -33,4 +35,3 @@ bool xe_destroy_wq_queue(struct work_struct *work);
+ void xe_destroy_wq_flush(void);
+ 
+ #endif
+-
 diff --git a/drivers/gpu/drm/xe/xe_pci.c b/drivers/gpu/drm/xe/xe_pci.c
-index 9cd873708..65a2cd84f 100644
+index 9cd873708136c5ac6cedc1360e89af67c446a1b2..65a2cd84f038fb6809abb9b781d8faf9c4ce960d 100644
 --- a/drivers/gpu/drm/xe/xe_pci.c
 +++ b/drivers/gpu/drm/xe/xe_pci.c
 @@ -373,6 +373,7 @@ static const struct xe_device_desc mtl_desc = {
@@ -944,8 +1853,42 @@ index 9cd873708..65a2cd84f 100644
  	.has_pxp = true,
  	.max_gt_per_tile = 2,
  	MULTI_LRC_MASK,
+diff --git a/drivers/gpu/drm/xe/xe_reg_whitelist.c b/drivers/gpu/drm/xe/xe_reg_whitelist.c
+index 526907d2d8246de5cd5be95971b643d3be40b950..8129264b3f3882e6b95d0ea0c19319c8253952ab 100644
+--- a/drivers/gpu/drm/xe/xe_reg_whitelist.c
++++ b/drivers/gpu/drm/xe/xe_reg_whitelist.c
+@@ -15,6 +15,7 @@
+ #include "xe_platform_types.h"
+ #include "xe_reg_sr.h"
+ #include "xe_rtp.h"
++#include "xe_sriov.h"
+ #include "xe_step.h"
+ 
+ #undef XE_REG_MCR
+@@ -41,7 +42,21 @@ static bool match_multi_queue_class(const struct xe_device *xe,
+ 	return xe_gt_supports_multi_queue(gt, hwe->class);
+ }
+ 
++static bool match_mtl_sriov_pf(const struct xe_device *xe,
++			       const struct xe_gt *gt,
++			       const struct xe_hw_engine *hwe)
++{
++	return IS_SRIOV_PF(xe);
++}
++
+ static const struct xe_rtp_table_sr register_whitelist = XE_RTP_TABLE_SR(
++	{ XE_RTP_NAME("mtl_sriov_rcc_keying"),
++	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1270, 1274), ENGINE_CLASS(RENDER),
++		       FUNC(match_mtl_sriov_pf)),
++	  /* Let the VF UMD request BTP+BTI cache keying, as it can on i915. */
++	  XE_RTP_ACTIONS(WHITELIST(XEHP_COMMON_SLICE_CHICKEN3,
++				   RING_FORCE_TO_NONPRIV_ACCESS_RW))
++	},
+ 	{ XE_RTP_NAME("WaAllowPMDepthAndInvocationCountAccessFromUMD, 1408556865"),
+ 	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1210), ENGINE_CLASS(RENDER)),
+ 	  XE_RTP_ACTIONS(WHITELIST(PS_INVOCATION_COUNT,
 diff --git a/drivers/gpu/drm/xe/xe_ring_ops.c b/drivers/gpu/drm/xe/xe_ring_ops.c
-index 08b4a4283..336d463dc 100644
+index 08b4a4283e96a23dce0e8c3946cef92c12a57ed8..336d463dcb2f038b701d52ab79a7e19ff3411677 100644
 --- a/drivers/gpu/drm/xe/xe_ring_ops.c
 +++ b/drivers/gpu/drm/xe/xe_ring_ops.c
 @@ -513,6 +513,7 @@ static void emit_migration_job_gen12(struct xe_sched_job *job,
@@ -972,12 +1915,115 @@ index 08b4a4283..336d463dc 100644
  
  	i = emit_flush_imm_ggtt(xe_lrc_seqno_ggtt_addr(lrc), seqno,
  				job->migrate_flush_flags,
+diff --git a/drivers/gpu/drm/xe/xe_sriov_trace_types.h b/drivers/gpu/drm/xe/xe_sriov_trace_types.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..88b38de493572ffb35c57fd48186a64246cd2a55
+--- /dev/null
++++ b/drivers/gpu/drm/xe/xe_sriov_trace_types.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef _XE_SRIOV_TRACE_TYPES_H_
++#define _XE_SRIOV_TRACE_TYPES_H_
++
++#include <linux/types.h>
++
++enum xe_sriov_trace_phase {
++	XE_SRIOV_TRACE_QUEUE,
++	XE_SRIOV_TRACE_WORK_BEGIN,
++	XE_SRIOV_TRACE_GGTT_SUBMIT,
++	XE_SRIOV_TRACE_GGTT_DONE,
++	XE_SRIOV_TRACE_TLB_BEGIN,
++	XE_SRIOV_TRACE_TLB_DONE,
++	XE_SRIOV_TRACE_RESPONSE_READY,
++	XE_SRIOV_TRACE_RESPONSE_SEND,
++	XE_SRIOV_TRACE_WORK_DONE,
++	XE_SRIOV_TRACE_REJECT,
++	XE_SRIOV_TRACE_RELAY_RECEIVE,
++	XE_SRIOV_TRACE_RELAY_HANDLE,
++	XE_SRIOV_TRACE_RELAY_RESULT,
++	XE_SRIOV_TRACE_GGTT_FENCE,
++};
++
++/* Owned by the outstanding request, then copied before its worker is queued. */
++struct xe_sriov_vf_trace {
++	u64 id;
++	u32 vfid;
++	u32 opcode;
++	u32 token;
++	u32 offset;
++	u32 count;
++	u16 copies;
++	u8 gt_id;
++	u8 mode;
++	bool ctb;
++	int generation;
++	int epoch;
++	int primary_epoch;
++};
++
++/* A send attempt to GuC, not an acknowledgment from the guest. */
++struct xe_sriov_pf_reply_trace {
++	u64 id;
++	u32 vfid;
++	u32 token;
++	u32 action;
++	bool ctb;
++	int result;
++	int send_result;
++};
++
++#endif
 diff --git a/drivers/gpu/drm/xe/xe_tlb_inval.c b/drivers/gpu/drm/xe/xe_tlb_inval.c
-index bbd21d393..d0c4edd4d 100644
+index bbd21d393062fd19769a704780dcf19fd15f5f6b..245467f3ff319ef1634c5ff445c4642bb3cea1a0 100644
 --- a/drivers/gpu/drm/xe/xe_tlb_inval.c
 +++ b/drivers/gpu/drm/xe/xe_tlb_inval.c
-@@ -317,6 +317,9 @@ int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval)
+@@ -87,8 +87,10 @@ static void xe_tlb_inval_fence_timeout(struct work_struct *work)
+ 
+ 		trace_xe_tlb_inval_fence_timeout(xe, fence);
+ 		drm_err(&xe->drm,
+-			"TLB invalidation fence timeout, seqno=%d recv=%d",
+-			fence->seqno, tlb_inval->seqno_recv);
++			"TLB invalidation timeout gt=%u origin_gt=%u vf=%u txn=%llu op=%u asid=%u seqno=%d recv=%d\n",
++			tlb_inval->trace_gt_id, fence->trace_origin_gt,
++			fence->trace_vfid, fence->trace_id,
++			fence->trace_op, fence->trace_asid, fence->seqno, tlb_inval->seqno_recv);
+ 
+ 		fence->base.error = -ETIME;
+ 		xe_tlb_inval_fence_signal(fence);
+@@ -140,6 +142,7 @@ int xe_gt_tlb_inval_init_early(struct xe_gt *gt)
+ 	int err;
+ 
+ 	tlb_inval->xe = xe;
++	tlb_inval->trace_gt_id = gt->info.id;
+ 	tlb_inval->seqno = 1;
+ 	INIT_LIST_HEAD(&tlb_inval->pending_fences);
+ 	spin_lock_init(&tlb_inval->pending_lock);
+@@ -297,6 +300,7 @@ static void xe_tlb_inval_fence_prep(struct xe_tlb_inval_fence *fence)
+ int xe_tlb_inval_all(struct xe_tlb_inval *tlb_inval,
+ 		     struct xe_tlb_inval_fence *fence)
+ {
++	fence->trace_op = XE_TLB_TRACE_ALL;
+ 	return xe_tlb_inval_issue(tlb_inval, fence, tlb_inval->ops->all);
+ }
+ 
+@@ -309,18 +313,40 @@ int xe_tlb_inval_all(struct xe_tlb_inval *tlb_inval,
+  *
+  * Return: 0 on success, negative error code on error
+  */
+-int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval)
++static int tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval,
++			  const struct xe_sriov_vf_trace *trace)
+ {
+ 	struct xe_tlb_inval_fence fence, *fence_ptr = &fence;
+ 	int ret;
+ 
  	xe_tlb_inval_fence_init(tlb_inval, fence_ptr, true);
++	fence.trace_op = XE_TLB_TRACE_GGTT;
++	if (trace) {
++		fence.trace_origin_gt = trace->gt_id;
++		fence.trace_vfid = trace->vfid;
++		fence.trace_id = trace->id;
++	}
  	ret = xe_tlb_inval_issue(tlb_inval, fence_ptr, tlb_inval->ops->ggtt);
  	xe_tlb_inval_fence_wait(fence_ptr);
 +	/* Do not acknowledge a VF mapping after a timed out invalidation. */
@@ -986,3 +2032,479 @@ index bbd21d393..d0c4edd4d 100644
  
  	return ret;
  }
+ 
++int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval)
++{
++	return tlb_inval_ggtt(tlb_inval, NULL);
++}
++
++/* Same GGTT invalidation, with VF ownership copied into its fence. */
++int xe_tlb_inval_ggtt_vf(struct xe_tlb_inval *tlb_inval,
++			 const struct xe_sriov_vf_trace *trace)
++{
++	return tlb_inval_ggtt(tlb_inval, trace);
++}
++
+ /**
+  * xe_tlb_inval_range() - Issue a TLB invalidation for an address range
+  * @tlb_inval: TLB invalidation client
+@@ -341,6 +367,10 @@ int xe_tlb_inval_range(struct xe_tlb_inval *tlb_inval,
+ 		       struct xe_tlb_inval_fence *fence, u64 start, u64 end,
+ 		       u32 asid, struct drm_suballoc *prl_sa)
+ {
++	fence->trace_op = XE_TLB_TRACE_RANGE;
++	fence->trace_asid = asid;
++	fence->trace_start = start;
++	fence->trace_end = end;
+ 	return xe_tlb_inval_issue(tlb_inval, fence, tlb_inval->ops->ppgtt,
+ 				  start, end, asid, prl_sa);
+ }
+@@ -467,6 +497,13 @@ void xe_tlb_inval_fence_init(struct xe_tlb_inval *tlb_inval,
+ 	else
+ 		dma_fence_get(&fence->base);
+ 	fence->tlb_inval = tlb_inval;
++	fence->trace_op = XE_TLB_TRACE_NONE;
++	fence->trace_origin_gt = tlb_inval->trace_gt_id;
++	fence->trace_vfid = 0;
++	fence->trace_id = 0;
++	fence->trace_asid = 0;
++	fence->trace_start = 0;
++	fence->trace_end = 0;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval.h b/drivers/gpu/drm/xe/xe_tlb_inval.h
+index a76b7823a5f2e272eb95e470cf577fd1d2f95cbf..e16f94faf5242b3e48feab6f59a2997655214222 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval.h
++++ b/drivers/gpu/drm/xe/xe_tlb_inval.h
+@@ -13,6 +13,7 @@
+ struct xe_gt;
+ struct xe_guc;
+ struct xe_vm;
++struct xe_sriov_vf_trace;
+ 
+ int xe_gt_tlb_inval_init_early(struct xe_gt *gt);
+ 
+@@ -20,6 +21,8 @@ void xe_tlb_inval_reset(struct xe_tlb_inval *tlb_inval);
+ int xe_tlb_inval_all(struct xe_tlb_inval *tlb_inval,
+ 		     struct xe_tlb_inval_fence *fence);
+ int xe_tlb_inval_ggtt(struct xe_tlb_inval *tlb_inval);
++int xe_tlb_inval_ggtt_vf(struct xe_tlb_inval *tlb_inval,
++			 const struct xe_sriov_vf_trace *trace);
+ void xe_tlb_inval_vm(struct xe_tlb_inval *tlb_inval, struct xe_vm *vm);
+ int xe_tlb_inval_range(struct xe_tlb_inval *tlb_inval,
+ 		       struct xe_tlb_inval_fence *fence,
+diff --git a/drivers/gpu/drm/xe/xe_tlb_inval_types.h b/drivers/gpu/drm/xe/xe_tlb_inval_types.h
+index 3d1797d186fd79a1392e8772f183ac408e5334dc..0749bc5fc8d63c9e87a1c723c0dfe8146d0d1574 100644
+--- a/drivers/gpu/drm/xe/xe_tlb_inval_types.h
++++ b/drivers/gpu/drm/xe/xe_tlb_inval_types.h
+@@ -14,6 +14,13 @@
+ struct drm_suballoc;
+ struct xe_tlb_inval;
+ 
++enum xe_tlb_trace_op {
++	XE_TLB_TRACE_NONE,
++	XE_TLB_TRACE_ALL,
++	XE_TLB_TRACE_GGTT,
++	XE_TLB_TRACE_RANGE,
++};
++
+ /** struct xe_tlb_inval_ops - TLB invalidation ops (backend) */
+ struct xe_tlb_inval_ops {
+ 	/**
+@@ -80,6 +87,8 @@ struct xe_tlb_inval {
+ 	void *private;
+ 	/** @xe: Pointer to Xe device */
+ 	struct xe_device *xe;
++	/** @trace_gt_id: GT identity for diagnostics */
++	u8 trace_gt_id;
+ 	/** @ops: TLB invalidation ops */
+ 	const struct xe_tlb_inval_ops *ops;
+ 	/** @tlb_inval.seqno: TLB invalidation seqno, protected by CT lock */
+@@ -132,6 +141,20 @@ struct xe_tlb_inval_fence {
+ 	int seqno;
+ 	/** @inval_time: time of TLB invalidation */
+ 	ktime_t inval_time;
++	/** @trace_op: operation, fixed before issue */
++	enum xe_tlb_trace_op trace_op;
++	/** @trace_origin_gt: requesting GT, which can differ from target */
++	u8 trace_origin_gt;
++	/** @trace_vfid: VF mapping owner, zero for PF */
++	u32 trace_vfid;
++	/** @trace_id: VF service transaction, zero for PF */
++	u64 trace_id;
++	/** @trace_asid: range address space */
++	u32 trace_asid;
++	/** @trace_start: range start */
++	u64 trace_start;
++	/** @trace_end: exclusive range end */
++	u64 trace_end;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/xe/xe_trace.h b/drivers/gpu/drm/xe/xe_trace.h
+index 750fa32c13b213d027ebf9892987e488486a4294..788b5b59652203098c94047196abeb55bc19bb70 100644
+--- a/drivers/gpu/drm/xe/xe_trace.h
++++ b/drivers/gpu/drm/xe/xe_trace.h
+@@ -20,6 +20,7 @@
+ #include "xe_sched_job.h"
+ #include "xe_tlb_inval_types.h"
+ #include "xe_vm.h"
++#include "xe_sriov_trace_types.h"
+ 
+ #define __dev_name_xe(xe)	dev_name((xe)->drm.dev)
+ #define __dev_name_tile(tile)	__dev_name_xe(tile_to_xe((tile)))
+@@ -34,16 +35,37 @@ DECLARE_EVENT_CLASS(xe_tlb_inval_fence,
+ 			     __string(dev, __dev_name_xe(xe))
+ 			     __field(struct xe_tlb_inval_fence *, fence)
+ 			     __field(int, seqno)
++			     __field(u8, gt)
++			     __field(u8, origin_gt)
++			     __field(u32, vfid)
++			     __field(u64, txn)
++			     __field(u32, op)
++			     __field(u32, asid)
++			     __field(u64, start)
++			     __field(u64, end)
++			     __field(int, error)
+ 			     ),
+ 
+ 		    TP_fast_assign(
+ 			   __assign_str(dev);
+ 			   __entry->fence = fence;
+ 			   __entry->seqno = fence->seqno;
++			   __entry->gt = fence->tlb_inval->trace_gt_id;
++			   __entry->origin_gt = fence->trace_origin_gt;
++			   __entry->vfid = fence->trace_vfid;
++			   __entry->txn = fence->trace_id;
++			   __entry->op = fence->trace_op;
++			   __entry->asid = fence->trace_asid;
++			   __entry->start = fence->trace_start;
++			   __entry->end = fence->trace_end;
++			   __entry->error = fence->base.error;
+ 			   ),
+ 
+-		    TP_printk("dev=%s, fence=%p, seqno=%d",
+-			      __get_str(dev), __entry->fence, __entry->seqno)
++		    TP_printk("dev=%s fence=%p seqno=%d gt=%u origin_gt=%u vfid=%u txn=%llu op=%u asid=%u start=%#llx end=%#llx error=%d",
++			      __get_str(dev), __entry->fence, __entry->seqno, __entry->gt,
++			      __entry->origin_gt, __entry->vfid, __entry->txn, __entry->op,
++			      __entry->asid,
++			      __entry->start, __entry->end, __entry->error)
+ );
+ 
+ DEFINE_EVENT(xe_tlb_inval_fence, xe_tlb_inval_fence_send,
+@@ -66,6 +88,300 @@ DEFINE_EVENT(xe_tlb_inval_fence, xe_tlb_inval_fence_timeout,
+ 	     TP_ARGS(xe, fence)
+ );
+ 
++TRACE_EVENT(xe_sriov_ggtt_assign,
++	TP_PROTO(struct xe_gt *gt, u16 vfid, u64 start, u64 size, bool gpu,
++		 bool done, u32 completed, int result),
++	TP_ARGS(gt, vfid, start, size, gpu, done, completed, result),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u16, vfid)
++		__field(u64, start)
++		__field(u64, size)
++		__field(bool, gpu)
++		__field(bool, done)
++		__field(u32, completed)
++		__field(int, result)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->vfid = vfid;
++		__entry->start = start;
++		__entry->size = size;
++		__entry->gpu = gpu;
++		__entry->done = done;
++		__entry->completed = completed;
++		__entry->result = result;
++	),
++	TP_printk("dev=%s gt=%u vfid=%u start=%#llx size=%#llx gpu=%u done=%u completed=%u result=%d",
++		  __get_str(dev), __entry->gt, __entry->vfid, __entry->start,
++		  __entry->size, __entry->gpu, __entry->done, __entry->completed,
++		  __entry->result)
++);
++
++TRACE_EVENT(xe_sriov_vf_request,
++	TP_PROTO(struct xe_gt *gt, const struct xe_sriov_vf_trace *trace,
++		 enum xe_sriov_trace_phase phase, int result, u64 context, u64 seqno),
++	TP_ARGS(gt, trace, phase, result, context, seqno),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, vfid)
++		__field(u64, txn)
++		__field(u32, opcode)
++		__field(u32, token)
++		__field(u32, offset)
++		__field(u32, count)
++		__field(u16, copies)
++		__field(u8, mode)
++		__field(bool, ctb)
++		__field(int, generation)
++		__field(int, epoch)
++		__field(int, primary_epoch)
++		__field(u32, phase)
++		__field(int, result)
++		__field(u64, context)
++		__field(u64, seqno)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->vfid = trace->vfid;
++		__entry->txn = trace->id;
++		__entry->opcode = trace->opcode;
++		__entry->token = trace->token;
++		__entry->offset = trace->offset;
++		__entry->count = trace->count;
++		__entry->copies = trace->copies;
++		__entry->mode = trace->mode;
++		__entry->ctb = trace->ctb;
++		__entry->generation = trace->generation;
++		__entry->epoch = trace->epoch;
++		__entry->primary_epoch = trace->primary_epoch;
++		__entry->phase = phase;
++		__entry->result = result;
++		__entry->context = context;
++		__entry->seqno = seqno;
++	),
++	TP_printk("dev=%s gt=%u vfid=%u txn=%llu ctb=%u opcode=%#x token=%#x phase=%u offset=%#x count=%u copies=%u mode=%u generation=%d epoch=%d primary_epoch=%d result=%d context=%llu seqno=%llu",
++		  __get_str(dev), __entry->gt, __entry->vfid, __entry->txn,
++		  __entry->ctb, __entry->opcode, __entry->token, __entry->phase,
++		  __entry->offset, __entry->count, __entry->copies, __entry->mode,
++		  __entry->generation, __entry->epoch, __entry->primary_epoch,
++		  __entry->result, __entry->context, __entry->seqno)
++);
++
++TRACE_EVENT(xe_sriov_relay,
++	TP_PROTO(struct xe_gt *gt, u32 vfid, u32 rid, u32 action,
++		 enum xe_sriov_trace_phase phase, int result),
++	TP_ARGS(gt, vfid, rid, action, phase, result),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, vfid)
++		__field(u32, rid)
++		__field(u32, action)
++		__field(u32, phase)
++		__field(int, result)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->vfid = vfid;
++		__entry->rid = rid;
++		__entry->action = action;
++		__entry->phase = phase;
++		__entry->result = result;
++	),
++	TP_printk("dev=%s gt=%u vfid=%u rid=%u action=%#x phase=%u result=%d",
++		  __get_str(dev), __entry->gt, __entry->vfid, __entry->rid,
++		  __entry->action, __entry->phase, __entry->result)
++);
++
++TRACE_EVENT(xe_sriov_guc_params,
++	TP_PROTO(struct xe_gt *gt, u32 wa, u32 feature, u32 ads),
++	TP_ARGS(gt, wa, feature, ads),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, wa)
++		__field(u32, feature)
++		__field(u32, ads)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->wa = wa;
++		__entry->feature = feature;
++		__entry->ads = ads;
++	),
++	TP_printk("dev=%s gt=%u wa=%#x feature=%#x ads=%#x",
++		  __get_str(dev), __entry->gt, __entry->wa,
++		  __entry->feature, __entry->ads)
++);
++
++TRACE_EVENT(xe_sriov_pf_wa_klv,
++	TP_PROTO(struct xe_gt *gt, u32 key, const u32 *data, u32 len, int result),
++	TP_ARGS(gt, key, data, len, result),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, key)
++		__field(u32, len)
++		__field(u32, copied)
++		__field(int, result)
++		__array(u32, data, 16)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->key = key;
++		__entry->len = len;
++		__entry->copied = min_t(u32, len, 16);
++		__entry->result = result;
++		memset(__entry->data, 0, sizeof(__entry->data));
++		if (__entry->copied)
++			memcpy(__entry->data, data, __entry->copied * sizeof(u32));
++	),
++	TP_printk("dev=%s gt=%u key=%#x len=%u copied=%u result=%d data=%s",
++		  __get_str(dev), __entry->gt, __entry->key, __entry->len,
++		  __entry->copied, __entry->result,
++		  __print_array(__entry->data, __entry->copied, sizeof(u32)))
++);
++
++TRACE_EVENT(xe_sriov_pf_guc_event,
++	TP_PROTO(struct xe_gt *gt, u32 action, bool handled, int result,
++		 const u32 *msg, u32 len),
++	TP_ARGS(gt, action, handled, result, msg, len),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, action)
++		__field(bool, handled)
++		__field(int, result)
++		__field(u32, len)
++		__field(u32, copied)
++		__array(u32, msg, 16)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->action = action;
++		__entry->handled = handled;
++		__entry->result = result;
++		__entry->len = len;
++		__entry->copied = min_t(u32, len, 16);
++		memset(__entry->msg, 0, sizeof(__entry->msg));
++		if (__entry->copied)
++			memcpy(__entry->msg, msg, __entry->copied * sizeof(u32));
++	),
++	TP_printk("dev=%s gt=%u action=%#x handled=%u result=%d len=%u copied=%u msg=%s",
++		  __get_str(dev), __entry->gt, __entry->action, __entry->handled,
++		  __entry->result, __entry->len, __entry->copied,
++		  __print_array(__entry->msg, __entry->copied, sizeof(u32)))
++);
++
++TRACE_EVENT(xe_sriov_pf_vf_state,
++	TP_PROTO(struct xe_gt *gt, u32 vfid, u32 bit, bool enter, unsigned long state),
++	TP_ARGS(gt, vfid, bit, enter, state),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, vfid)
++		__field(u32, bit)
++		__field(bool, enter)
++		__field(unsigned long, state)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->vfid = vfid;
++		__entry->bit = bit;
++		__entry->enter = enter;
++		__entry->state = state;
++	),
++	TP_printk("dev=%s gt=%u vfid=%u bit=%u enter=%u state=%#lx",
++		  __get_str(dev), __entry->gt, __entry->vfid, __entry->bit,
++		  __entry->enter, __entry->state)
++);
++
++TRACE_EVENT(xe_sriov_pf_adverse,
++	TP_PROTO(struct xe_gt *gt, u32 vfid, u32 key, u32 threshold, int result),
++	TP_ARGS(gt, vfid, key, threshold, result),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u32, vfid)
++		__field(u32, key)
++		__field(u32, threshold)
++		__field(int, result)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->vfid = vfid;
++		__entry->key = key;
++		__entry->threshold = threshold;
++		__entry->result = result;
++	),
++	TP_printk("dev=%s gt=%u vfid=%u key=%#x threshold=%u result=%d",
++		  __get_str(dev), __entry->gt, __entry->vfid, __entry->key,
++		  __entry->threshold, __entry->result)
++);
++
++TRACE_EVENT(xe_sriov_pf_service_reply,
++	TP_PROTO(struct xe_gt *gt, const struct xe_sriov_pf_reply_trace *meta,
++		 const u32 *request, u32 request_len, const u32 *reply, u32 reply_len),
++	TP_ARGS(gt, meta, request, request_len, reply, reply_len),
++	TP_STRUCT__entry(
++		__string(dev, __dev_name_gt(gt))
++		__field(u8, gt)
++		__field(u64, id)
++		__field(u32, vfid)
++		__field(u32, token)
++		__field(u32, action)
++		__field(bool, ctb)
++		__field(int, result)
++		__field(int, send_result)
++		__field(u32, request_len)
++		__field(u32, request_copied)
++		__field(u32, reply_len)
++		__field(u32, reply_copied)
++		__array(u32, request, 8)
++		__array(u32, reply, 64)
++	),
++	TP_fast_assign(
++		__assign_str(dev);
++		__entry->gt = gt->info.id;
++		__entry->id = meta->id;
++		__entry->vfid = meta->vfid;
++		__entry->token = meta->token;
++		__entry->action = meta->action;
++		__entry->ctb = meta->ctb;
++		__entry->result = meta->result;
++		__entry->send_result = meta->send_result;
++		__entry->request_len = request_len;
++		__entry->request_copied = min_t(u32, request_len, 8);
++		__entry->reply_len = reply_len;
++		__entry->reply_copied = min_t(u32, reply_len, 64);
++		memset(__entry->request, 0, sizeof(__entry->request));
++		memset(__entry->reply, 0, sizeof(__entry->reply));
++		if (__entry->request_copied)
++			memcpy(__entry->request, request,
++			       __entry->request_copied * sizeof(u32));
++		if (__entry->reply_copied)
++			memcpy(__entry->reply, reply, __entry->reply_copied * sizeof(u32));
++	),
++	TP_printk("dev=%s gt=%u vfid=%u ctb=%u id=%llu token=%#x action=%#x result=%d send_result=%d request_len=%u request_copied=%u reply_len=%u reply_copied=%u request=%s reply=%s",
++		  __get_str(dev), __entry->gt, __entry->vfid, __entry->ctb,
++		  __entry->id, __entry->token, __entry->action, __entry->result,
++		  __entry->send_result, __entry->request_len, __entry->request_copied,
++		  __entry->reply_len, __entry->reply_copied,
++		  __print_array(__entry->request, __entry->request_copied, sizeof(u32)),
++		  __print_array(__entry->reply, __entry->reply_copied, sizeof(u32)))
++);
++
+ DECLARE_EVENT_CLASS(xe_exec_queue,
+ 		    TP_PROTO(struct xe_exec_queue *q),
+ 		    TP_ARGS(q),
+diff --git a/drivers/gpu/drm/xe/xe_tuning.c b/drivers/gpu/drm/xe/xe_tuning.c
+index bf3fad9cdbef4976f0fc321f15b06cd68d5fd83d..fc3a7c68b20737b79a1525dc0aef33b91eab59ab 100644
+--- a/drivers/gpu/drm/xe/xe_tuning.c
++++ b/drivers/gpu/drm/xe/xe_tuning.c
+@@ -22,7 +22,7 @@
+ 
+ static const struct xe_rtp_table_sr gt_tunings = XE_RTP_TABLE_SR(
+ 	{ XE_RTP_NAME("Tuning: Blend Fill Caching Optimization Disable"),
+-	  XE_RTP_RULES(PLATFORM(DG2)),
++	  XE_RTP_RULES(PLATFORM(DG2), OR, GRAPHICS_VERSION_RANGE(1270, 1274)),
+ 	  XE_RTP_ACTIONS(SET(XEHP_L3SCQREG7, BLEND_FILL_CACHING_OPT_DIS))
+ 	},
+ 	{ XE_RTP_NAME("Tuning: 32B Access Enable"),

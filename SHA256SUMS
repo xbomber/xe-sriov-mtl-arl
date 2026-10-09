@@ -1,1 +1,2 @@
-35bf49e2ab68f66e7a8100a8106a1e79f9c41993d1cc9f984a7f46a13a7fd387  patches/linux-7.2.7-xe-mtl-arl-sriov-experimental.patch
+825b95d97069f76db96de6f53a3edf4178e6223a8105e3b736e09149a4725b7f  patches/linux-7.2.7-xe-mtl-arl-sriov-experimental.patch
+add980e75382f4aa2bbb7baa9f0891f47645a756f02039d38336774af48206bc  patches/linux-7.2.7-xe-mtl-arl-rcc-permission.patch

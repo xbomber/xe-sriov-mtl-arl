@@ -1,7 +1,46 @@
 Base commit: c4227406af3b9ad8f8072b222ca06e0039f64441
-Fresh patch extraction from the tested kernel build source.
-git apply --check: PASS
-git apply: PASS
-Resulting Xe source files: 20/20 match the compiled-source SHA-256 manifest.
-Scope: 20 Xe files, 620 insertions, 2 deletions.
-This validates patch application and source identity, not general hardware support.
+Source snapshot: boot-tested 2026-10-09 RCC permission variant.
+Full patch: git apply --check and git apply PASS.
+All 552 reviewed Xe source hashes match the boot-tested module sources.
+Published changed-source manifest: 33/33 PASS.
+Reverse apply check: PASS.
+Standalone RCC patch: apply check and apply PASS on the exact Intel base.
+Standalone resulting whitelist equals the boot-tested whitelist.
+The standalone patch is already included in the full patch; do not apply both.
+
+ drivers/gpu/drm/xe/abi/guc_ggtt_relay_abi.h       |  18 +
+ drivers/gpu/drm/xe/abi/guc_mmio_relay_abi.h       |  30 ++
+ drivers/gpu/drm/xe/instructions/xe_mi_commands.h  |   1 +
+ drivers/gpu/drm/xe/xe_ggtt.c                      | 176 +++++++-
+ drivers/gpu/drm/xe/xe_ggtt.h                      |  10 +-
+ drivers/gpu/drm/xe/xe_gt_debugfs.c                | 191 +++++++++
+ drivers/gpu/drm/xe/xe_gt_sriov_pf.c               |   2 +
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_config.c        |  22 +-
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_control.c       |  14 +
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_control.h       |   1 +
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_monitor.c       |   5 +
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_service.c       | 478 +++++++++++++++++++++-
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_service.h       |  13 +
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_service_types.h |  29 ++
+ drivers/gpu/drm/xe/xe_gt_sriov_pf_types.h         |   2 +
+ drivers/gpu/drm/xe/xe_guc.c                       |  22 +
+ drivers/gpu/drm/xe/xe_guc_ads.c                   |   7 +
+ drivers/gpu/drm/xe/xe_guc_ct.c                    |  47 +++
+ drivers/gpu/drm/xe/xe_guc_ct.h                    |   1 +
+ drivers/gpu/drm/xe/xe_guc_relay.c                 |  43 +-
+ drivers/gpu/drm/xe/xe_migrate.c                   |  53 +++
+ drivers/gpu/drm/xe/xe_migrate.h                   |   3 +
+ drivers/gpu/drm/xe/xe_module.c                    |  10 +
+ drivers/gpu/drm/xe/xe_module.h                    |   3 +-
+ drivers/gpu/drm/xe/xe_pci.c                       |   1 +
+ drivers/gpu/drm/xe/xe_reg_whitelist.c             |  15 +
+ drivers/gpu/drm/xe/xe_ring_ops.c                  |   5 +-
+ drivers/gpu/drm/xe/xe_sriov_trace_types.h         |  52 +++
+ drivers/gpu/drm/xe/xe_tlb_inval.c                 |  43 +-
+ drivers/gpu/drm/xe/xe_tlb_inval.h                 |   3 +
+ drivers/gpu/drm/xe/xe_tlb_inval_types.h           |  23 ++
+ drivers/gpu/drm/xe/xe_trace.h                     | 320 ++++++++++++++-
+ drivers/gpu/drm/xe/xe_tuning.c                    |   2 +-
+ 33 files changed, 1622 insertions(+), 23 deletions(-)
+
+This validates source identity/application, not support for other kernel bases or hardware.

@@ -1,0 +1,76 @@
+{
+  "date": "2026-10-09",
+  "intelBase": "c4227406af3b9ad8f8072b222ca06e0039f64441",
+  "device": "8086:7d51",
+  "physicalPlatformTested": "Arrow Lake-P",
+  "guestVf": 2,
+  "guestCount": 1,
+  "logicalIntelAdaptersTested": 3,
+  "windowsUmdVersion": "32.0.101.8132",
+  "windowsUmdSha256": "ba93c259bcdb48fdf282c18b1b322ff4d95ab21fb8035cc4aad5101d3b9912fc",
+  "windowsKmdFileSha256": "696cdb31ac661c5b404ab413490a2e77026d5c2bb1c4e9996efddf87d2190093",
+  "baselineNative": {
+    "cases": 8,
+    "failures": 4
+  },
+  "postbootNative": {
+    "cases": 24,
+    "failures": 0,
+    "taggedA8": "7f",
+    "taggedBgra": "ff332211",
+    "unchangedFinalPipeControl": "00100001",
+    "unchangedNoClearCommandCount": 12,
+    "commandMutation": false,
+    "flushOrWaitBetweenCopies": false,
+    "softwareAdapterExcluded": true
+  },
+  "settings": {
+    "captures": 8,
+    "resizeCount": 40,
+    "allFramesCorrect": true,
+    "brightPixelCounts": {
+      "name": 457,
+      "email": 701
+    },
+    "oldUncorrectedBrightPixelCounts": {
+      "name": 0,
+      "email": 0
+    },
+    "measurement": "Framebuffer brightness in profile regions; not texture alpha"
+  },
+  "readers": [
+    {
+      "samples": 7454,
+      "qualifiedVf2": 0,
+      "permit7304": 0,
+      "bit13Set": 0
+    },
+    {
+      "samples": 7448,
+      "qualifiedVf2": 166,
+      "permit7304": 166,
+      "bit13Set": 82
+    },
+    {
+      "samples": 7449,
+      "qualifiedVf2": 355,
+      "permit7304": 355,
+      "bit13Set": 311
+    }
+  ],
+  "sourceVerification": {
+    "reviewedFiles": 552,
+    "changedFiles": 33,
+    "allSourceHashesMatchBootTestedSource": true
+  },
+  "probeQualification": {
+    "gpuTestSourceUnchanged": true,
+    "gpuTestSourceSha256": "e4d8570e9f50fecba2c452f23a7d10113be118a9b97a9e299168d712993cab74",
+    "prebootExeSha256": "9d6fab99deb1d6d0f02601b2a6f0afe085316589c26a485078021644e145f6cd",
+    "postbootExeSha256": "bbf63658506692309349731a0f464e4c681c708557041073a60bedfc5c39291a",
+    "difference": "V7 recompiles only adapter identity selection/reporting; this is not the exact same binary as preboot V6."
+  },
+  "observationalLimits": "Sequential VF/MMIO brackets; no MCR lock/context pause; ABA and draw attribution not excluded.",
+  "standalonePatchBootTested": false,
+  "allSriovFeaturesCertified": false
+}

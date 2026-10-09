@@ -4,9 +4,9 @@ This is an independent, experimental research project. It is not an official Int
 
 The patch forces a platform capability that the examined Intel Xe source does not enable for MTL/ARL. It adds VF/PF services based on public code and documentation. Enabling the flag does not establish complete hardware or driver support.
 
-Hardware testing has been performed on one Arrow Lake-P system, PCI device **8086:7d51**, with one Windows VF. Meteor Lake hardware, other Arrow Lake devices, multiple active VFs, concurrent resets, suspend/resume and long-term stability have not been validated.
+The latest RCC test used one Arrow Lake-P system, PCI device **8086:7d51**, and one Windows VF (VF2). Earlier bring-up used VF1. Meteor Lake hardware, other Arrow Lake devices, simultaneous guests with this corrected snapshot, concurrent resets, suspend/resume and long-term stability have not been validated.
 
-**Known graphical defects remain:** some text and application labels are missing until the mouse passes over them. This has been observed both in Looking Glass and in a direct Windows desktop capture. Successful GPU API calls and received frames do not establish correct rendering in all workloads.
+The October 9 PF register permission corrects the reproduced A8/BGRA corruption and the measured Settings text defect. These results cover a specific ARL/VF2 configuration. All Windows UI elements, other graphics workloads and the complete SR-IOV feature set have not been certified. See [measured results and limits](docs/RCC_FIX.md).
 
 Use this software only on systems reserved for experimentation. GPU hangs, host or guest instability, display loss, and loss of unsaved work are possible. Keep a working fallback kernel and a recovery path available.
 

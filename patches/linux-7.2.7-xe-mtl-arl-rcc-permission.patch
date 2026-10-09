@@ -1,0 +1,33 @@
+diff --git a/drivers/gpu/drm/xe/xe_reg_whitelist.c b/drivers/gpu/drm/xe/xe_reg_whitelist.c
+--- a/drivers/gpu/drm/xe/xe_reg_whitelist.c
++++ b/drivers/gpu/drm/xe/xe_reg_whitelist.c
+@@ -15,6 +15,7 @@
+ #include "xe_platform_types.h"
+ #include "xe_reg_sr.h"
+ #include "xe_rtp.h"
++#include "xe_sriov.h"
+ #include "xe_step.h"
+ 
+ #undef XE_REG_MCR
+@@ -41,7 +42,21 @@
+ 	return xe_gt_supports_multi_queue(gt, hwe->class);
+ }
+ 
++static bool match_mtl_sriov_pf(const struct xe_device *xe,
++			       const struct xe_gt *gt,
++			       const struct xe_hw_engine *hwe)
++{
++	return IS_SRIOV_PF(xe);
++}
++
+ static const struct xe_rtp_table_sr register_whitelist = XE_RTP_TABLE_SR(
++	{ XE_RTP_NAME("mtl_sriov_rcc_keying"),
++	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1270, 1274), ENGINE_CLASS(RENDER),
++		       FUNC(match_mtl_sriov_pf)),
++	  /* Let the VF UMD request BTP+BTI cache keying, as it can on i915. */
++	  XE_RTP_ACTIONS(WHITELIST(XEHP_COMMON_SLICE_CHICKEN3,
++				   RING_FORCE_TO_NONPRIV_ACCESS_RW))
++	},
+ 	{ XE_RTP_NAME("WaAllowPMDepthAndInvocationCountAccessFromUMD, 1408556865"),
+ 	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1210), ENGINE_CLASS(RENDER)),
+ 	  XE_RTP_ACTIONS(WHITELIST(PS_INVOCATION_COUNT,

@@ -25,6 +25,19 @@ The manuals consulted are not a complete public MTL/ARL firmware or errata speci
 
 Relevant i915 components examined include `intel_iov_service.c`, `intel_iov_ggtt.c`, `intel_ggtt.c`, the GuC MMIO/CTB relay ABI headers, and MTL-specific runtime register handling. Relevant Xe components include platform descriptors, PF service/relay handling, GGTT provisioning, migration queues, ring submission and TLB invalidation.
 
+## Render color cache permission, October 9
+
+The latest fix follows a Windows driver request to set bit 13 of `COMMON_SLICE_CHICKEN3`, a missing permission observed in VF-qualified PF register samples, and a reproducible D3D11 A8-to-BGRA copy failure. The PF permission change restores correct copies and the measured Settings text without changing the Windows driver. [Investigation, results and limitations](RCC_FIX.md).
+
+Relevant primary source references:
+
+- [i915 register whitelist commit cebc13de](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/cebc13de7e704b1355bea208a9f9cdb042c74588).
+- [Xe per-queue programming of bit 13, commit 0e07b163](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/0e07b16371b6eef9b5a4a1fd3e7942938811072e).
+- [Mesa BTP+BTI RCC keying, commit af2d51ea](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/af2d51eafa9969c5240b6ac4b8902e787513f3a6).
+- [Iris binding-table state and render-target flush requirements](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/87afa3193eee4c6dbdef4306a7c6ead6a5a4d825/src/gallium/drivers/iris/iris_state.c).
+
+These references explain the hardware mode. They do not establish a Vulkan path for the affected Windows UI.
+
 ## Public Intel technical documents
 
 - [Intel Core Ultra Network and Edge Platforms datasheet addendum, document 793432](https://cdrdv2-public.intel.com/793432/793432_Intel_Core_Ultra_Datasheet_Rev001.pdf), February 2024, pages 13–16: graphics SR-IOV, GuC and VF/PF communication.
@@ -37,7 +50,9 @@ Only public references were used. Restricted Intel RDC material was not obtained
 
 ## Extraction and verification
 
-The initial patch was freshly extracted from the kernel build worktree against the exact Intel base. It includes the two new ABI headers and all 18 modified Xe files. A separate checkout was used to verify application and the resulting file hashes against the build manifest.
+The initial October 5 patch contained two new ABI headers and 18 modified Xe files. The October 9 full patch is freshly extracted against the same Intel base from the exact source used for the loaded signed RCC module. It changes 33 Xe files. A separate checkout verifies application, reverse application and every one of the 552 reviewed Xe source hashes. The published manifest lists the 33 changed files.
+
+The single-file RCC patch was also applied independently to the Intel base; its resulting whitelist matches the boot-tested source. That check establishes source application, while the hardware test used the cumulative full snapshot with its documented boot options. The full snapshot retains diagnostic instrumentation and earlier experiments so it can reproduce the tested source; the standalone diff identifies the new functional permission change.
 
 The repository records an experimental source snapshot. Review by Intel/Linux maintainers has not taken place. Human review remains necessary before upstream submission, including review of code provenance and licensing.
 
